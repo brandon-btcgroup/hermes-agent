@@ -108,6 +108,8 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    SIMPLEX = "simplex"
+
     @classmethod
     def _missing_(cls, value):
         """Accept unknown platform names only for known plugin adapters.
@@ -372,6 +374,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     ),
     Platform.WHATSAPP: lambda cfg: True,  # bridge handles auth
     Platform.SIGNAL: lambda cfg: bool(cfg.extra.get("http_url")),
+    Platform.SIMPLEX: lambda cfg: bool(
+        cfg.extra.get("ws_url") and cfg.extra.get("group_ids")
+    ),
     Platform.EMAIL: lambda cfg: bool(cfg.extra.get("address")),
     Platform.SMS: lambda cfg: bool(os.getenv("TWILIO_ACCOUNT_SID")),
     Platform.API_SERVER: lambda cfg: True,
@@ -1212,6 +1217,29 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=signal_home,
             name=os.getenv("SIGNAL_HOME_CHANNEL_NAME", "Home"),
             thread_id=os.getenv("SIGNAL_HOME_CHANNEL_THREAD_ID") or None,
+        )
+
+    # SimpleX (talks directly to a simplex-chat daemon over WebSocket)
+    simplex_ws_url = os.getenv("SIMPLEX_WS_URL")
+    simplex_group_ids_raw = os.getenv("SIMPLEX_GROUP_IDS", "")
+    if simplex_ws_url:
+        group_ids = [g.strip() for g in simplex_group_ids_raw.split(",") if g.strip()]
+        if Platform.SIMPLEX not in config.platforms:
+            config.platforms[Platform.SIMPLEX] = PlatformConfig()
+        config.platforms[Platform.SIMPLEX].enabled = True
+        config.platforms[Platform.SIMPLEX].extra.update({
+            "ws_url": simplex_ws_url,
+            "group_ids": group_ids,
+            "max_reconnect_delay_s": int(
+                os.getenv("SIMPLEX_MAX_RECONNECT_DELAY_S", "60")
+            ),
+        })
+    simplex_home = os.getenv("SIMPLEX_HOME_GROUP_ID")
+    if simplex_home and Platform.SIMPLEX in config.platforms:
+        config.platforms[Platform.SIMPLEX].home_channel = HomeChannel(
+            platform=Platform.SIMPLEX,
+            chat_id=simplex_home,
+            name=os.getenv("SIMPLEX_HOME_GROUP_NAME", "Home"),
         )
 
     # Mattermost
