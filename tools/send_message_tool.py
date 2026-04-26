@@ -651,6 +651,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_qqbot(pconfig, chat_id, chunk)
         elif platform == Platform.YUANBAO:
             result = await _send_yuanbao(chat_id, chunk)
+        elif platform == Platform.SIMPLEX:
+            result = await _send_simplex(pconfig.extra, chat_id, chunk)
         else:
             # Plugin platform — route through the gateway's live adapter
             # if available, otherwise report the error.
@@ -1765,6 +1767,48 @@ async def _send_yuanbao(chat_id, message, media_files=None):
         return await send_yuanbao_direct(adapter, chat_id, message, media_files=media_files)
     except Exception as e:
         return _error(f"Yuanbao send failed: {e}")
+
+
+async def _send_simplex(extra, chat_id, message):
+    """One-shot send to a SimpleX group via the simplex-chat WebSocket.
+
+    Used by cron jobs and the send_message tool when no long-lived
+    gateway adapter is available.  Opens a WS, sends the message, closes.
+    """
+    from gateway.platforms.simplex_client import (
+        SimplexChatClient,
+        SimplexConnectionClosed,
+        SimplexProtocolError,
+    )
+
+    ws_url = extra.get("ws_url") or os.getenv("SIMPLEX_WS_URL", "")
+    if not ws_url:
+        return _error("SIMPLEX_WS_URL not configured")
+    try:
+        group_id = int(chat_id)
+    except (TypeError, ValueError):
+        return _error(f"simplex chat_id must be a numeric group id, got {chat_id!r}")
+
+    client = SimplexChatClient(ws_url)
+    try:
+        await client.connect()
+        resp = await client.api_send_text_message_to_group(group_id, message)
+    except (SimplexConnectionClosed, SimplexProtocolError) as e:
+        return _error(f"simplex: {e}")
+    except Exception as e:
+        return _error(f"simplex: {e}")
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "platform": "simplex",
+        "chat_id": chat_id,
+        "message_id": str(resp.item_id) if resp.item_id is not None else None,
+    }
 
 
 # --- Registry ---

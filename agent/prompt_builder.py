@@ -401,6 +401,16 @@ PLATFORM_HINTS = {
         "files arrive as downloadable documents. You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as photos."
     ),
+    "simplex": (
+        "You are talking with the user over SimpleX Chat — a privacy-focused, "
+        "decentralized messenger. The conversation happens inside a SimpleX group. "
+        "SimpleX clients render plain text well; markdown is NOT rendered, prefer "
+        "plain text. This adapter currently sends only text — do NOT include "
+        "MEDIA:/path tags, image URLs, or file references in your reply, since "
+        "they would be sent as literal text. Replies are not streamed — the user "
+        "sees the whole reply when you finish. SimpleX has no typing indicator "
+        "(a protocol limitation, not an adapter gap). Keep replies concise."
+    ),
     "email": (
         "You are communicating via email. Write clear, well-structured responses "
         "suitable for email. Use plain text formatting (no markdown). "

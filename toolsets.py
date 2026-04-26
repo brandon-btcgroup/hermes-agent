@@ -403,6 +403,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-simplex": {
+        "description": "SimpleX bot toolset - privacy-focused, decentralized messaging via simplex-chat (full access)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-bluebubbles": {
         "description": "BlueBubbles iMessage bot toolset - Apple iMessage via local BlueBubbles server",
         "tools": _HERMES_CORE_TOOLS,
@@ -503,7 +509,7 @@ TOOLSETS = {
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook", "hermes-yuanbao"]
+        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-simplex", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook", "hermes-yuanbao"]
     }
 }
 

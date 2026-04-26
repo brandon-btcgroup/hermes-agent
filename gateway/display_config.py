@@ -88,6 +88,7 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,
+    "simplex":         _TIER_LOW,  # simplex-chat has no edit API in v1
     "whatsapp":        _TIER_MEDIUM,  # Baileys bridge supports /edit
     "bluebubbles":     _TIER_LOW,
     "weixin":          _TIER_LOW,
