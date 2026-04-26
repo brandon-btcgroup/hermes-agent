@@ -8807,6 +8807,12 @@ def main():
     slack_parser.set_defaults(func=cmd_slack)
 
     # =========================================================================
+    # simplex command (list/join SimpleX Chat groups)
+    # =========================================================================
+    from hermes_cli.simplex import add_simplex_subparser
+    add_simplex_subparser(subparsers)
+
+    # =========================================================================
     # login command
     # =========================================================================
     login_parser = subparsers.add_parser(
