@@ -739,9 +739,10 @@ async def test_inbound_image_skipped_when_too_large(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_inbound_pending_file_not_dispatched_with_media(tmp_path, monkeypatch):
-    """File still downloading: skip media URL, surface a textual placeholder."""
+async def test_inbound_pending_file_text_downgrade_when_wait_disabled(tmp_path, monkeypatch):
+    """SIMPLEX_FILE_WAIT_S=0 disables polling; pending files become text immediately."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SIMPLEX_FILE_WAIT_S", "0")
     a = _make_adapter(group_ids=["12"])
     a._file_dir = tmp_path / "files"
     a._file_dir.mkdir()
@@ -764,6 +765,136 @@ async def test_inbound_pending_file_not_dispatched_with_media(tmp_path, monkeypa
     assert len(captured) == 1
     assert captured[0].media_urls == []
     assert captured[0].message_type == MessageType.TEXT
+
+
+def _bare_image_chat_item(item_id, file_id, file_name, status):
+    """Bare chatItem (no chatInfo) with a file envelope — what api_get_chat returns."""
+    return {
+        "chatDir": {
+            "type": "groupRcv",
+            "groupMember": {
+                "localDisplayName": "brandon",
+                "memberProfile": {"displayName": "brandon"},
+            },
+        },
+        "content": {"type": "rcvMsgContent", "msgContent": {"type": "image", "text": ""}},
+        "meta": {"itemId": item_id},
+        "file": {
+            "fileId": file_id,
+            "fileName": file_name,
+            "fileSize": 100,
+            "fileStatus": {"type": status},
+        },
+    }
+
+
+class _PollingClient:
+    """Returns the same chatItem repeatedly with file_status flipped after N calls."""
+
+    def __init__(self, *, item_id, file_id, file_name, complete_after=2):
+        self._item_id = item_id
+        self._file_id = file_id
+        self._file_name = file_name
+        self._complete_after = complete_after
+        self.calls = 0
+
+    async def api_get_chat(self, *, group_id, count, after_id=None):
+        self.calls += 1
+        status = "rcvComplete" if self.calls > self._complete_after else "rcvTransfer"
+        return [_bare_image_chat_item(self._item_id, self._file_id, self._file_name, status)]
+
+
+@pytest.mark.asyncio
+async def test_pending_media_polls_and_dispatches_on_completion(tmp_path, monkeypatch):
+    """When the file flips to rcvComplete during the poll window, dispatch with media."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SIMPLEX_FILE_WAIT_S", "5")
+    a = _make_adapter(group_ids=["12"])
+    a._file_dir = tmp_path / "files"
+    a._file_dir.mkdir()
+    a._media_enabled = True
+    # The file will exist on disk by the time polling sees rcvComplete.
+    (a._file_dir / "later.jpg").write_bytes(b"jpeg-data")
+    a._client = _PollingClient(item_id=42, file_id=1, file_name="later.jpg", complete_after=1)
+    # Speed up the poll interval so the test runs in ms, not seconds.
+    monkeypatch.setattr("gateway.platforms.simplex._FILE_POLL_INTERVAL_S", 0.01)
+
+    captured: list[MessageEvent] = []
+
+    async def handler(ev):
+        captured.append(ev)
+
+    a.set_message_handler(handler)
+    item = _group_rcv_image(12, "later.jpg", status="rcvTransfer", item_id=42)
+    item["chatItem"]["file"]["fileId"] = 1
+    await a._dispatch_chat_item(item)
+
+    # Wait for poll task to complete + dispatch.
+    for _ in range(50):
+        await asyncio.sleep(0.05)
+        if captured:
+            break
+
+    for t in list(a._background_tasks):
+        try:
+            await t
+        except Exception:
+            pass
+
+    assert len(captured) == 1
+    ev = captured[0]
+    assert ev.message_type == MessageType.PHOTO
+    assert ev.media_urls == [str(a._file_dir / "later.jpg")]
+
+
+class _NeverCompleteClient:
+    """Always returns the same item still-pending, so polling will time out."""
+
+    def __init__(self, *, item_id, file_id, file_name):
+        self._item = _bare_image_chat_item(item_id, file_id, file_name, "rcvTransfer")
+
+    async def api_get_chat(self, *, group_id, count, after_id=None):
+        return [self._item]
+
+
+@pytest.mark.asyncio
+async def test_pending_media_falls_back_to_text_on_timeout(tmp_path, monkeypatch):
+    """If the file never completes within SIMPLEX_FILE_WAIT_S, dispatch text fallback."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # Sub-second deadline to keep the test fast.
+    monkeypatch.setenv("SIMPLEX_FILE_WAIT_S", "0.05")
+    a = _make_adapter(group_ids=["12"])
+    a._file_dir = tmp_path / "files"
+    a._file_dir.mkdir()
+    a._media_enabled = True
+    a._client = _NeverCompleteClient(item_id=42, file_id=2, file_name="stuck.jpg")
+    monkeypatch.setattr("gateway.platforms.simplex._FILE_POLL_INTERVAL_S", 0.01)
+
+    captured: list[MessageEvent] = []
+
+    async def handler(ev):
+        captured.append(ev)
+
+    a.set_message_handler(handler)
+    item = _group_rcv_image(12, "stuck.jpg", status="rcvTransfer", item_id=42)
+    item["chatItem"]["file"]["fileId"] = 2
+    await a._dispatch_chat_item(item)
+
+    for _ in range(50):
+        await asyncio.sleep(0.05)
+        if captured:
+            break
+
+    for t in list(a._background_tasks):
+        try:
+            await t
+        except Exception:
+            pass
+
+    assert len(captured) == 1
+    assert captured[0].message_type == MessageType.TEXT
+    assert "stuck.jpg" in captured[0].text
+    assert "not delivered" in captured[0].text
 
 
 class _MediaSendClient:

@@ -173,7 +173,7 @@ available; voice/video include a duration probed by `ffprobe` if installed.
 ## What's not yet implemented
 
 - **Direct messages.** Hermes only listens in groups for now. To talk 1:1, create a 2-person group.
-- **Auto-receive recovery.** If the daemon was started without auto-receive enabled, large incoming files arrive in `rcvAccepted` state and are not delivered to Hermes until they download. v2.1 will poll `/freceive` and dispatch on completion.
+- **Manual auto-receive recovery.** If the daemon was started without auto-receive enabled, files stay in `rcvInvitation` and the adapter's polling never sees them complete. Pass `--auto-accept-files <bytes>` to the daemon (or `-a` for unlimited). The adapter handles the wait-for-download race for files the daemon *does* accept; it cannot accept on the daemon's behalf.
 - **Streaming replies via message edits.** `apiUpdateChatItem` exists at the protocol level, but how SimpleX phone clients render in-place edits is unverified. Tracked behind a real-device test.
 - **Reactions.** Need to verify protocol support before scoping.
 - **Typing indicators.** Permanent gap — simplex-chat itself has no typing API. Not an adapter limitation; would require upstream simplex-chat to add it.
@@ -216,3 +216,4 @@ The adapter reads `chatDir.groupMember.localDisplayName` (with a fallback to `me
 | `SIMPLEX_FILE_DIR` | for media | Host path bind-mounted to the daemon's files folder (default `~/.hermes/cache/simplex-files`) |
 | `SIMPLEX_DAEMON_FILES_FOLDER` | no | Container-side files folder (default `/root/.simplex/files`) |
 | `SIMPLEX_MAX_FILE_BYTES` | no | Reject inbound/outbound files above this size in bytes (default 52428800 = 50 MiB) |
+| `SIMPLEX_FILE_WAIT_S` | no | Seconds to wait for inbound XFTP downloads to finish before falling back to a text placeholder (default 60). Set to `0` to disable polling and downgrade pending files immediately. |

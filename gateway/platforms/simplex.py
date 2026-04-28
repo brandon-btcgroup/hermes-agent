@@ -88,6 +88,13 @@ _THUMBNAIL_MAX_PX = 224
 # default and is overridable via SIMPLEX_MAX_FILE_BYTES.
 _DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MiB
 
+# Inbound file-download wait window. simplex-chat emits newChatItems the
+# moment the file invitation is received, well before the XFTP download
+# completes; the adapter buffers the chat item and polls /_get chat for
+# rcvComplete, falling back to a text placeholder after the deadline.
+_DEFAULT_FILE_WAIT_S = 60.0
+_FILE_POLL_INTERVAL_S = 3.0
+
 
 
 def check_simplex_requirements() -> bool:
@@ -101,6 +108,18 @@ def _hermes_home() -> Path:
 
 def _cursor_file_path() -> Path:
     return _hermes_home() / "simplex" / "cursors.json"
+
+
+def _find_chat_item_with_file(
+    chat_items: List[Dict[str, Any]], file_id: int
+) -> Optional[Dict[str, Any]]:
+    for entry in chat_items:
+        if not isinstance(entry, dict):
+            continue
+        f = entry.get("file") or {}
+        if f.get("fileId") == file_id:
+            return entry
+    return None
 
 
 def _max_item_id(chat_items: List[Dict[str, Any]]) -> Optional[int]:
@@ -308,8 +327,17 @@ class SimplexAdapter(BasePlatformAdapter):
             )
         except ValueError:
             self._max_file_bytes = _DEFAULT_MAX_FILE_BYTES
+        try:
+            self._file_wait_s = max(
+                0.0, float(os.getenv("SIMPLEX_FILE_WAIT_S", str(_DEFAULT_FILE_WAIT_S)))
+            )
+        except ValueError:
+            self._file_wait_s = _DEFAULT_FILE_WAIT_S
         # Set on connect once the bind-mount is verified writable.
         self._media_enabled: bool = False
+        # In-flight media items keyed by daemon fileId; entries are scrubbed
+        # by their poll task on completion or timeout.
+        self._pending_media: Dict[int, asyncio.Task] = {}
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -656,25 +684,73 @@ class SimplexAdapter(BasePlatformAdapter):
             self._note_seen(item_id)
         message_id = str(item_id) if isinstance(item_id, int) else uuid4().hex
 
-        media_urls: List[str] = []
-        media_types: List[str] = []
         if message_type != MessageType.TEXT:
-            host_path = self._resolve_inbound_file(chat_item, gid_str)
+            host_path, resolution = self._resolve_inbound_file(chat_item, gid_str)
+            if resolution == "pending" and self._file_wait_s > 0:
+                # File still downloading. Buffer the item and let a background
+                # poll task dispatch it once rcvComplete fires (or fall back
+                # after SIMPLEX_FILE_WAIT_S). Cursor advances anyway: the
+                # message is "seen" even if its file ultimately fails.
+                if isinstance(item_id, int):
+                    self._advance_cursor(gid_str, item_id)
+                self._spawn_pending_media_poll(
+                    item=item,
+                    chat_item=chat_item,
+                    chat_info=chat_info,
+                    gid_str=gid_str,
+                    sender=sender,
+                    message_id=message_id,
+                    text=text,
+                    message_type=message_type,
+                    media_mime=media_mime,
+                )
+                return
             if host_path is None:
-                # Either media is disabled, the file isn't downloaded yet,
-                # or it exceeded SIMPLEX_MAX_FILE_BYTES. _resolve_inbound_file
-                # has already logged the reason; downgrade to a text event so
-                # the conversation still records that something arrived.
+                # "disabled" / "rejected" — won't recover by waiting.
                 fname = ((chat_item.get("file") or {}).get("fileName")) or "(file)"
                 text = (
                     f"[simplex {message_type.value} — {fname} not delivered]"
                     + (f" {text}" if text else "")
                 )
                 message_type = MessageType.TEXT
+                media_urls: List[str] = []
+                media_types: List[str] = []
             else:
                 media_urls = [str(host_path)]
                 media_types = [media_mime or "application/octet-stream"]
+        else:
+            media_urls = []
+            media_types = []
 
+        await self._build_and_dispatch(
+            item=item,
+            chat_info=chat_info,
+            gid_str=gid_str,
+            sender=sender,
+            message_id=message_id,
+            text=text,
+            message_type=message_type,
+            media_urls=media_urls,
+            media_types=media_types,
+        )
+
+        if isinstance(item_id, int):
+            self._advance_cursor(gid_str, item_id)
+
+    async def _build_and_dispatch(
+        self,
+        *,
+        item: Dict[str, Any],
+        chat_info: Dict[str, Any],
+        gid_str: str,
+        sender: str,
+        message_id: str,
+        text: str,
+        message_type: MessageType,
+        media_urls: List[str],
+        media_types: List[str],
+    ) -> None:
+        group_info = chat_info.get("groupInfo") or {}
         source = self.build_source(
             chat_id=gid_str,
             chat_name=group_info.get("displayName", gid_str),
@@ -695,10 +771,6 @@ class SimplexAdapter(BasePlatformAdapter):
             await self.handle_message(event_obj)
         except Exception as e:
             logger.exception("simplex: handle_message raised: %r", e)
-            return
-
-        if isinstance(item_id, int):
-            self._advance_cursor(gid_str, item_id)
 
     # ── Outbound media ──────────────────────────────────────────────────
 
@@ -811,34 +883,34 @@ class SimplexAdapter(BasePlatformAdapter):
 
     def _resolve_inbound_file(
         self, chat_item: Dict[str, Any], gid_str: str
-    ) -> Optional[Path]:
-        """Return the host path for an inbound attachment, or None if it
-        cannot be delivered (media disabled, file pending, too large)."""
+    ) -> Tuple[Optional[Path], str]:
+        """Resolve an inbound attachment to (host_path, status_tag).
+
+        - ("ready", path)   — file is on disk; dispatch immediately with media
+        - ("pending", None) — XFTP transfer hasn't completed yet; caller may
+          buffer and poll
+        - ("disabled", None) / ("rejected", None) — won't recover by waiting
+          (media not enabled, file too large, missing fileName, missing file
+          on host after rcvComplete); caller should downgrade to text
+        """
         if not self._media_enabled:
             logger.debug("simplex: media disabled, dropping attachment in group %s", gid_str)
-            return None
+            return None, "disabled"
         file_envelope = chat_item.get("file") or {}
         fname = file_envelope.get("fileName")
         if not isinstance(fname, str) or not fname:
             logger.debug("simplex: inbound media has no fileName")
-            return None
+            return None, "rejected"
         size = file_envelope.get("fileSize")
         if isinstance(size, int) and self._max_file_bytes and size > self._max_file_bytes:
             logger.warning(
                 "simplex: rejecting inbound file %r in group %s — %d bytes exceeds SIMPLEX_MAX_FILE_BYTES=%d",
                 fname, gid_str, size, self._max_file_bytes,
             )
-            return None
+            return None, "rejected"
         status = (file_envelope.get("fileStatus") or {}).get("type")
         if status not in {"rcvComplete", "sndStored", "sndComplete", None}:
-            # Daemon hasn't finished receiving the file yet. v2.1 will poll
-            # for completion via /freceive + a fileStatus event handler;
-            # for now, surface the gap rather than dispatch a broken path.
-            logger.info(
-                "simplex: file %r in group %s is %s — skipping (not yet downloaded)",
-                fname, gid_str, status,
-            )
-            return None
+            return None, "pending"
         host_path = self._file_dir / fname
         if not host_path.exists():
             logger.warning(
@@ -846,8 +918,125 @@ class SimplexAdapter(BasePlatformAdapter):
                 "check that SIMPLEX_FILE_DIR matches the daemon bind-mount",
                 fname, status, host_path,
             )
-            return None
-        return host_path
+            return None, "rejected"
+        return host_path, "ready"
+
+    def _spawn_pending_media_poll(
+        self,
+        *,
+        item: Dict[str, Any],
+        chat_item: Dict[str, Any],
+        chat_info: Dict[str, Any],
+        gid_str: str,
+        sender: str,
+        message_id: str,
+        text: str,
+        message_type: MessageType,
+        media_mime: Optional[str],
+    ) -> None:
+        """Buffer an in-flight media item; poll /_get chat for rcvComplete."""
+        file_envelope = chat_item.get("file") or {}
+        file_id = file_envelope.get("fileId")
+        if not isinstance(file_id, int):
+            return
+        if file_id in self._pending_media:
+            return  # already polling
+        task = asyncio.create_task(
+            self._poll_pending_media(
+                file_id=file_id,
+                item=item,
+                chat_item=chat_item,
+                chat_info=chat_info,
+                gid_str=gid_str,
+                sender=sender,
+                message_id=message_id,
+                text=text,
+                message_type=message_type,
+                media_mime=media_mime,
+            ),
+            name=f"simplex-pending-file-{file_id}",
+        )
+        self._pending_media[file_id] = task
+        task.add_done_callback(lambda _t, fid=file_id: self._pending_media.pop(fid, None))
+
+    async def _poll_pending_media(
+        self,
+        *,
+        file_id: int,
+        item: Dict[str, Any],
+        chat_item: Dict[str, Any],
+        chat_info: Dict[str, Any],
+        gid_str: str,
+        sender: str,
+        message_id: str,
+        text: str,
+        message_type: MessageType,
+        media_mime: Optional[str],
+    ) -> None:
+        deadline = asyncio.get_event_loop().time() + self._file_wait_s
+        try:
+            gid = int(gid_str)
+        except ValueError:
+            return
+        host_path: Optional[Path] = None
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                await asyncio.sleep(_FILE_POLL_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
+            if self._client is None:
+                continue
+            try:
+                # Fetch a small window around the original item so we can
+                # spot the same fileId with its updated status.
+                items = await self._client.api_get_chat(group_id=gid, count=10)
+            except Exception as e:
+                logger.debug("simplex: pending-media poll fetch failed: %r", e)
+                continue
+            updated = _find_chat_item_with_file(items, file_id)
+            if updated is None:
+                continue
+            new_status = ((updated.get("file") or {}).get("fileStatus") or {}).get("type")
+            if new_status in {"rcvComplete", "sndStored", "sndComplete"}:
+                fname = (updated.get("file") or {}).get("fileName")
+                if isinstance(fname, str):
+                    candidate = self._file_dir / fname
+                    if candidate.exists():
+                        host_path = candidate
+                break
+        if host_path is None:
+            logger.warning(
+                "simplex: file %d in group %s did not complete within %.0fs — "
+                "delivering text placeholder",
+                file_id, gid_str, self._file_wait_s,
+            )
+            fname = ((chat_item.get("file") or {}).get("fileName")) or "(file)"
+            await self._build_and_dispatch(
+                item=item,
+                chat_info=chat_info,
+                gid_str=gid_str,
+                sender=sender,
+                message_id=message_id,
+                text=(
+                    f"[simplex {message_type.value} — {fname} not delivered]"
+                    + (f" {text}" if text else "")
+                ),
+                message_type=MessageType.TEXT,
+                media_urls=[],
+                media_types=[],
+            )
+            return
+        await self._build_and_dispatch(
+            item=item,
+            chat_info=chat_info,
+            gid_str=gid_str,
+            sender=sender,
+            message_id=message_id,
+            text=text,
+            message_type=message_type,
+            media_urls=[str(host_path)],
+            media_types=[media_mime or "application/octet-stream"],
+        )
 
     # ── Replay ──────────────────────────────────────────────────────────
 
