@@ -372,7 +372,12 @@ class SimplexAdapter(BasePlatformAdapter):
                 "displayName", self._known_groups.get(group_id, gid_str)
             )
 
-        sender = (chat_dir.get("groupMember") or {}).get("displayName") or "unknown"
+        member = chat_dir.get("groupMember") or {}
+        sender = (
+            member.get("localDisplayName")
+            or (member.get("memberProfile") or {}).get("displayName")
+            or "unknown"
+        )
         text = msg_content.get("text") or ""
         meta = chat_item.get("meta") or {}
         item_id = meta.get("itemId")

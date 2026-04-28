@@ -108,7 +108,13 @@ def _group_rcv_text(group_id, text="hi", sender="brandon", item_id=42):
             "groupInfo": {"groupId": group_id, "displayName": f"group {group_id}"},
         },
         "chatItem": {
-            "chatDir": {"type": "groupRcv", "groupMember": {"displayName": sender}},
+            "chatDir": {
+                "type": "groupRcv",
+                "groupMember": {
+                    "localDisplayName": sender,
+                    "memberProfile": {"displayName": sender},
+                },
+            },
             "content": {"type": "rcvMsgContent", "msgContent": {"type": "text", "text": text}},
             "meta": {"itemId": item_id},
         },

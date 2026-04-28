@@ -150,7 +150,7 @@ Hermes can't reach `SIMPLEX_WS_URL`. Verify the URL is right (note `ws://`, not 
 The invitation handshake takes seconds-to-minutes. Wait, then re-list. If the daemon was offline when you generated the invite, regenerate it.
 
 **Sender shows as "unknown"**
-The inbound event is missing `chatDir.groupMember.displayName`. Likely the sender hasn't set a profile name in SimpleX yet.
+The adapter reads `chatDir.groupMember.localDisplayName` (with a fallback to `memberProfile.displayName`). If both are empty, the sender hasn't set a profile name in SimpleX yet — set one under Settings → Your profile and resend.
 
 ---
 
