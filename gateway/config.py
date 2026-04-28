@@ -1233,6 +1233,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "max_reconnect_delay_s": int(
                 os.getenv("SIMPLEX_MAX_RECONNECT_DELAY_S", "60")
             ),
+            "file_dir": os.getenv("SIMPLEX_FILE_DIR", "").strip() or None,
+            "daemon_files_folder": os.getenv(
+                "SIMPLEX_DAEMON_FILES_FOLDER", "/root/.simplex/files"
+            ),
         })
     simplex_home = os.getenv("SIMPLEX_HOME_GROUP_ID")
     if simplex_home and Platform.SIMPLEX in config.platforms:

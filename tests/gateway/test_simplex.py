@@ -40,6 +40,8 @@ def test_env_loading_roundtrip(monkeypatch):
     monkeypatch.setenv("SIMPLEX_GROUP_IDS", "12, 13 , 14")
     monkeypatch.setenv("SIMPLEX_HOME_GROUP_ID", "12")
     monkeypatch.setenv("SIMPLEX_MAX_RECONNECT_DELAY_S", "120")
+    monkeypatch.setenv("SIMPLEX_FILE_DIR", "/srv/simplex/files")
+    monkeypatch.setenv("SIMPLEX_DAEMON_FILES_FOLDER", "/data/simplex/files")
 
     cfg = load_gateway_config()
     sx = cfg.platforms[Platform.SIMPLEX]
@@ -47,6 +49,8 @@ def test_env_loading_roundtrip(monkeypatch):
     assert sx.extra["ws_url"] == "ws://daemon:5225"
     assert sx.extra["group_ids"] == ["12", "13", "14"]
     assert sx.extra["max_reconnect_delay_s"] == 120
+    assert sx.extra["file_dir"] == "/srv/simplex/files"
+    assert sx.extra["daemon_files_folder"] == "/data/simplex/files"
     assert sx.home_channel.chat_id == "12"
     assert Platform.SIMPLEX in cfg.get_connected_platforms()
 
@@ -171,12 +175,17 @@ async def test_dispatch_drops_unsubscribed_group():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_drops_non_text_content():
+async def test_dispatch_drops_unknown_msg_content():
+    """Unsupported msgContent types (e.g. 'link') are silently dropped."""
     a = _make_adapter(group_ids=["12"])
     received: list[MessageEvent] = []
-    a.set_message_handler(lambda ev: received.append(ev) or None)
+
+    async def handler(ev):
+        received.append(ev)
+
+    a.set_message_handler(handler)
     item = _group_rcv_text(12)
-    item["chatItem"]["content"]["msgContent"]["type"] = "image"
+    item["chatItem"]["content"]["msgContent"]["type"] = "link"
     await a._dispatch_chat_item(item)
     await asyncio.sleep(0.02)
     assert received == []
@@ -306,11 +315,13 @@ async def test_send_typing_is_noop():
 
 
 @pytest.mark.asyncio
-async def test_send_image_returns_unimplemented():
+async def test_send_image_disabled_when_media_not_verified():
+    """send_image refuses with a clear message until the bind-mount is verified."""
     a = _make_adapter()
+    # _verify_media_dir wasn't called (no connect()), so media is disabled.
     result = await a.send_image("12", "https://example.com/cat.png", caption="hi")
     assert result.success is False
-    assert "not implemented" in (result.error or "").lower()
+    assert "media disabled" in (result.error or "").lower()
 
 
 # ── get_chat_info ───────────────────────────────────────────────────────
@@ -559,4 +570,285 @@ async def test_replay_disabled_skips_walk(tmp_path, monkeypatch):
 
     await a._replay_missed_messages()
     assert received == []
+    assert a._client.calls == []
+
+
+# ── Media: classifier, bind-mount, inbound, outbound ───────────────────
+
+
+from gateway.platforms.base import MessageType
+from gateway.platforms.simplex import (
+    _build_outbound_msg_content,
+    _classify_msg_content,
+)
+
+
+def test_classify_msg_content_known_types():
+    assert _classify_msg_content("text") == (MessageType.TEXT, None)
+    assert _classify_msg_content("image")[0] == MessageType.PHOTO
+    assert _classify_msg_content("file")[0] == MessageType.DOCUMENT
+    assert _classify_msg_content("voice")[0] == MessageType.VOICE
+    assert _classify_msg_content("video")[0] == MessageType.VIDEO
+
+
+def test_classify_msg_content_unknown_returns_none():
+    assert _classify_msg_content("link") == (None, None)
+    assert _classify_msg_content(None) == (None, None)
+
+
+def test_build_outbound_msg_content_file_no_caption(tmp_path):
+    f = tmp_path / "x.bin"
+    f.write_bytes(b"x")
+    mc = _build_outbound_msg_content("file", f, None)
+    assert mc == {"type": "file", "text": ""}
+
+
+def test_build_outbound_msg_content_file_with_caption(tmp_path):
+    f = tmp_path / "x.pdf"
+    f.write_bytes(b"x")
+    mc = _build_outbound_msg_content("file", f, "the doc")
+    assert mc == {"type": "file", "text": "the doc"}
+
+
+def test_build_outbound_msg_content_image_optional_thumbnail(tmp_path):
+    f = tmp_path / "x.jpg"
+    f.write_bytes(b"not really an image")
+    mc = _build_outbound_msg_content("image", f, "caption")
+    assert mc["type"] == "image"
+    assert mc["text"] == "caption"
+    # Pillow may or may not be present and the content isn't a real image —
+    # either way the build must not raise; thumbnail is optional.
+    assert "image" not in mc or mc["image"].startswith("data:image/jpeg;base64,")
+
+
+def test_verify_media_dir_enables_when_writable(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _make_adapter(group_ids=["12"])
+    a._file_dir = tmp_path / "files"
+    a._verify_media_dir()
+    assert a._media_enabled is True
+    assert (tmp_path / "files").is_dir()
+
+
+def test_verify_media_dir_disables_when_unwritable(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _make_adapter(group_ids=["12"])
+    # Point at a path that can't be created (parent is a file, not a dir).
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("blocking")
+    a._file_dir = blocker / "files"
+    a._verify_media_dir()
+    assert a._media_enabled is False
+
+
+def _group_rcv_image(group_id, file_name, file_size=100, status="rcvComplete", item_id=42):
+    item = _group_rcv_text(group_id, item_id=item_id)
+    item["chatItem"]["content"]["msgContent"] = {"type": "image", "text": "look"}
+    item["chatItem"]["file"] = {
+        "fileId": 1,
+        "fileName": file_name,
+        "fileSize": file_size,
+        "fileStatus": {"type": status},
+    }
+    return item
+
+
+@pytest.mark.asyncio
+async def test_inbound_image_resolves_to_host_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _make_adapter(group_ids=["12"])
+    a._file_dir = tmp_path / "files"
+    a._file_dir.mkdir()
+    (a._file_dir / "cat.jpg").write_bytes(b"jpeg-data")
+    a._media_enabled = True
+
+    captured: list[MessageEvent] = []
+
+    async def handler(ev):
+        captured.append(ev)
+
+    a.set_message_handler(handler)
+    await a._dispatch_chat_item(_group_rcv_image(12, "cat.jpg"))
+    await asyncio.sleep(0.05)
+    for t in list(a._background_tasks):
+        try:
+            await t
+        except Exception:
+            pass
+
+    assert len(captured) == 1
+    ev = captured[0]
+    assert ev.message_type == MessageType.PHOTO
+    assert ev.media_urls == [str(a._file_dir / "cat.jpg")]
+    assert ev.media_types == ["image/jpeg"]
+
+
+@pytest.mark.asyncio
+async def test_inbound_image_downgrades_when_media_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _make_adapter(group_ids=["12"])
+    a._media_enabled = False
+    captured: list[MessageEvent] = []
+
+    async def handler(ev):
+        captured.append(ev)
+
+    a.set_message_handler(handler)
+    await a._dispatch_chat_item(_group_rcv_image(12, "cat.jpg"))
+    await asyncio.sleep(0.05)
+    for t in list(a._background_tasks):
+        try:
+            await t
+        except Exception:
+            pass
+
+    assert len(captured) == 1
+    ev = captured[0]
+    assert ev.message_type == MessageType.TEXT
+    assert "cat.jpg" in ev.text
+    assert "not delivered" in ev.text
+
+
+@pytest.mark.asyncio
+async def test_inbound_image_skipped_when_too_large(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SIMPLEX_MAX_FILE_BYTES", "100")
+    a = _make_adapter(group_ids=["12"])
+    a._file_dir = tmp_path / "files"
+    a._file_dir.mkdir()
+    a._media_enabled = True
+    captured: list[MessageEvent] = []
+
+    async def handler(ev):
+        captured.append(ev)
+
+    a.set_message_handler(handler)
+    item = _group_rcv_image(12, "big.jpg", file_size=1_000_000)
+    await a._dispatch_chat_item(item)
+    await asyncio.sleep(0.05)
+    for t in list(a._background_tasks):
+        try:
+            await t
+        except Exception:
+            pass
+
+    # Downgraded to a text-only event mentioning the rejection.
+    assert len(captured) == 1
+    assert captured[0].message_type == MessageType.TEXT
+    assert "big.jpg" in captured[0].text
+
+
+@pytest.mark.asyncio
+async def test_inbound_pending_file_not_dispatched_with_media(tmp_path, monkeypatch):
+    """File still downloading: skip media URL, surface a textual placeholder."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _make_adapter(group_ids=["12"])
+    a._file_dir = tmp_path / "files"
+    a._file_dir.mkdir()
+    a._media_enabled = True
+    captured: list[MessageEvent] = []
+
+    async def handler(ev):
+        captured.append(ev)
+
+    a.set_message_handler(handler)
+    item = _group_rcv_image(12, "later.jpg", status="rcvAccepted")
+    await a._dispatch_chat_item(item)
+    await asyncio.sleep(0.05)
+    for t in list(a._background_tasks):
+        try:
+            await t
+        except Exception:
+            pass
+
+    assert len(captured) == 1
+    assert captured[0].media_urls == []
+    assert captured[0].message_type == MessageType.TEXT
+
+
+class _MediaSendClient:
+    """Records api_send_message_with_file_to_group calls."""
+
+    def __init__(self):
+        self.calls: list[tuple[int, dict, str]] = []
+
+    async def api_send_message_with_file_to_group(self, group_id, msg_content, container_file_path):
+        self.calls.append((group_id, msg_content, container_file_path))
+        return SendResponse(item_id=11, raw={"type": "newChatItems"})
+
+
+@pytest.mark.asyncio
+async def test_send_image_file_local_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    a = _make_adapter(group_ids=["12"])
+    a._file_dir = tmp_path / "files"
+    a._file_dir.mkdir()
+    a._media_enabled = True
+    a._client = _MediaSendClient()
+
+    src = tmp_path / "src.jpg"
+    src.write_bytes(b"img-data")
+
+    result = await a.send_image_file("12", str(src), caption="hello")
+    assert result.success is True
+    assert result.message_id == "11"
+    assert len(a._client.calls) == 1
+    gid, msg_content, container_path = a._client.calls[0]
+    assert gid == 12
+    assert msg_content["type"] == "image"
+    assert msg_content["text"] == "hello"
+    # File got staged into SIMPLEX_FILE_DIR with a uuid name preserving .jpg
+    staged = list(a._file_dir.glob("*.jpg"))
+    assert len(staged) == 1
+    # Container path uses the daemon-side files folder + the staged basename.
+    assert container_path.endswith("/" + staged[0].name)
+    assert container_path.startswith("/root/.simplex/files/")
+
+
+@pytest.mark.asyncio
+async def test_send_document_uses_file_msg_content(tmp_path):
+    a = _make_adapter(group_ids=["12"])
+    a._file_dir = tmp_path / "files"
+    a._file_dir.mkdir()
+    a._media_enabled = True
+    a._client = _MediaSendClient()
+
+    src = tmp_path / "report.pdf"
+    src.write_bytes(b"PDF")
+
+    result = await a.send_document("12", str(src), caption="quarterly")
+    assert result.success is True
+    _, msg_content, _ = a._client.calls[0]
+    assert msg_content == {"type": "file", "text": "quarterly"}
+
+
+@pytest.mark.asyncio
+async def test_send_media_rejects_oversize(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIMPLEX_MAX_FILE_BYTES", "10")
+    a = _make_adapter(group_ids=["12"])
+    a._file_dir = tmp_path / "files"
+    a._file_dir.mkdir()
+    a._media_enabled = True
+    a._client = _MediaSendClient()
+
+    src = tmp_path / "huge.bin"
+    src.write_bytes(b"x" * 100)
+
+    result = await a.send_image_file("12", str(src))
+    assert result.success is False
+    assert "exceeds" in (result.error or "").lower()
+    assert a._client.calls == []
+    # Staged copy was cleaned up.
+    assert list(a._file_dir.glob("*.bin")) == []
+
+
+@pytest.mark.asyncio
+async def test_send_media_disabled_returns_clear_error(tmp_path):
+    a = _make_adapter(group_ids=["12"])
+    a._media_enabled = False
+    a._client = _MediaSendClient()
+
+    result = await a.send_image_file("12", str(tmp_path / "x.png"), caption="x")
+    assert result.success is False
+    assert "media disabled" in (result.error or "").lower()
     assert a._client.calls == []

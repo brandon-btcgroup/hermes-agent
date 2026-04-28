@@ -112,9 +112,10 @@ Send a message in the group from your phone. Hermes should reply within a few se
 
 ---
 
-## What works in v1
+## What works
 
 - Inbound text messages from configured groups → full Hermes session, slash commands, cron, skills, tool calls.
+- Inbound + outbound **media** — image, file, voice, and video — over a shared bind-mount (see [Media setup](#media-setup) below).
 - Outbound text replies.
 - Self-echo filtering (Hermes ignores its own messages).
 - Allowlist on the sender's display name (`SIMPLEX_ALLOWED_USERS`).
@@ -122,11 +123,58 @@ Send a message in the group from your phone. Hermes should reply within a few se
 - Cron delivery: `cronjob action="create" deliver="simplex" target="<group_id>" ...`.
 - Missed-message replay across Hermes restarts. On reconnect, the adapter walks `/_get chat` forward from a per-group cursor stored at `~/.hermes/simplex/cursors.json` and dispatches anything new, capped by `SIMPLEX_REPLAY_MAX` (default 200).
 
-## What's not in v1
+## Media setup
+
+simplex-chat reads and writes attachments under a "files folder" inside its
+container (default `/root/.simplex/files`). For Hermes — running outside the
+container — to deliver attachments to the agent and to send outbound files,
+that folder must be **bind-mounted to a host directory readable by Hermes**.
+
+Add the mount to your daemon's run config. Example for a Quadlet `.container` file:
+
+```ini
+Volume=%h/.hermes/cache/simplex-files:/root/.simplex/files:Z
+```
+
+Or for `docker-compose.yml`:
+
+```yaml
+services:
+  simplex-chat:
+    image: simplexchat/simplex-chat:latest
+    volumes:
+      - simplex-chat-data:/root/.simplex
+      - ~/.hermes/cache/simplex-files:/root/.simplex/files
+```
+
+Then in `~/.hermes/.env`:
+
+```bash
+SIMPLEX_FILE_DIR=~/.hermes/cache/simplex-files          # host path; default
+SIMPLEX_DAEMON_FILES_FOLDER=/root/.simplex/files        # container path; default
+SIMPLEX_MAX_FILE_BYTES=52428800                         # 50 MiB; default
+```
+
+On connect, the adapter writes a probe file to `SIMPLEX_FILE_DIR`. If the path
+is missing or unwritable, media is disabled with a warning and **text continues
+to work**.
+
+**Inbound flow.** When a phone sends an image/file/voice/video, simplex-chat
+writes it to the container files folder; with the bind-mount, the file appears
+on the host at `SIMPLEX_FILE_DIR/<fileName>` and Hermes surfaces it to the
+agent as a `media_urls=[host_path]` event.
+
+**Outbound flow.** `send_image`, `send_image_file`, `send_voice`, and
+`send_video` stage the source file into `SIMPLEX_FILE_DIR/<uuid>-<name>` and
+hand the daemon the matching container path via `/_send`'s `fileSource`
+field. Image and video msgContent include a base64 thumbnail when Pillow is
+available; voice/video include a duration probed by `ffprobe` if installed.
+
+## What's not yet implemented
 
 - **Direct messages.** Hermes only listens in groups for now. To talk 1:1, create a 2-person group.
-- **Images, files, voice, video.** Protocol-supported by simplex-chat (`MsgContent` types `image`, `file`, `voice`, `video`); just not implemented yet in this adapter. Tracked for v1.1+.
-- **Streaming replies via message edits.** `apiUpdateChatItem` exists at the protocol level, but how SimpleX phone clients render in-place edits is unverified. Tracked for v1.1+ behind a real-device test.
+- **Auto-receive recovery.** If the daemon was started without auto-receive enabled, large incoming files arrive in `rcvAccepted` state and are not delivered to Hermes until they download. v2.1 will poll `/freceive` and dispatch on completion.
+- **Streaming replies via message edits.** `apiUpdateChatItem` exists at the protocol level, but how SimpleX phone clients render in-place edits is unverified. Tracked behind a real-device test.
 - **Reactions.** Need to verify protocol support before scoping.
 - **Typing indicators.** Permanent gap — simplex-chat itself has no typing API. Not an adapter limitation; would require upstream simplex-chat to add it.
 ## Security notes
@@ -165,3 +213,6 @@ The adapter reads `chatDir.groupMember.localDisplayName` (with a fallback to `me
 | `SIMPLEX_MAX_RECONNECT_DELAY_S` | no | Cap on exponential backoff between reconnect attempts (default 60) |
 | `SIMPLEX_REPLAY_MAX` | no | Maximum missed messages replayed per group on reconnect (default 200) |
 | `SIMPLEX_REPLAY_DISABLE` | no | `true` to skip missed-message replay entirely |
+| `SIMPLEX_FILE_DIR` | for media | Host path bind-mounted to the daemon's files folder (default `~/.hermes/cache/simplex-files`) |
+| `SIMPLEX_DAEMON_FILES_FOLDER` | no | Container-side files folder (default `/root/.simplex/files`) |
+| `SIMPLEX_MAX_FILE_BYTES` | no | Reject inbound/outbound files above this size in bytes (default 52428800 = 50 MiB) |

@@ -13,32 +13,46 @@ Requires:
     listen in. Discover them with ``hermes simplex join <invite-link>``
     or ``hermes simplex list``.
 
-v1 scope (text + groups only):
-  - Inbound text messages from configured groups → MessageEvent.
-  - Outbound text via ``/_send #<groupId> json [...]``.
+Capabilities:
+  - Inbound text + image/file/voice/video from configured groups.
+  - Outbound text + image/file/voice/video via ``/_send``.
   - Self-echo filtered via ``chatDir.type == 'groupRcv'``.
   - Allowlist enforced on the sender's display name
     (SIMPLEX_ALLOWED_USERS), with the same shape as Signal/WhatsApp.
+  - Missed-message replay on reconnect via per-group cursors stored at
+    ``$HERMES_HOME/simplex/cursors.json``.
 
-Missed-message replay across Hermes restarts: per-group last-dispatched
-itemId is persisted at ``$HERMES_HOME/simplex/cursors.json``; on reconnect
-the adapter walks ``/_get chat #<gid> after=<id> count=N`` forward until
-the daemon returns no more items or ``SIMPLEX_REPLAY_MAX`` is hit.
+Media bind-mount:
+  simplex-chat reads/writes attachments under a "files folder" inside its
+  container (default ``/root/.simplex/files``). For Hermes (running outside
+  the container) to deliver attachments to the agent and to send outbound
+  files, the container's files folder must be bind-mounted to a host
+  directory readable by Hermes. The host path is configured via
+  ``SIMPLEX_FILE_DIR`` (default ``$HERMES_HOME/cache/simplex-files``); the
+  container path is ``SIMPLEX_DAEMON_FILES_FOLDER`` (default
+  ``/root/.simplex/files``). When the host path isn't readable on connect,
+  media is disabled with a warning and text-only operation continues.
 
-Known v1 gaps (tracked for v1.1):
-  - No images / files / voice / typing indicators / streaming edits.
+Known gaps (tracked for v2.1+):
+  - Direct messages, reactions, streaming edits, typing indicators.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import logging
 import os
 import random
+import shutil
+import subprocess
+import urllib.parse
+import urllib.request
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from gateway.config import Platform, PlatformConfig
@@ -65,6 +79,16 @@ _DEDUPE_RING_SIZE = 1024
 # Replay paginates /_get chat in batches of this size.
 _REPLAY_PAGE_SIZE = 50
 
+# Default outbound thumbnail size for image/video — small enough to keep the
+# /_send command JSON compact, large enough that phone clients render a usable
+# preview before the full file downloads.
+_THUMBNAIL_MAX_PX = 224
+
+# File-size guardrail for inbound media; matches a reasonable per-message
+# default and is overridable via SIMPLEX_MAX_FILE_BYTES.
+_DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MiB
+
+
 
 def check_simplex_requirements() -> bool:
     """Return True iff the env has enough config for the SimpleX adapter."""
@@ -87,6 +111,149 @@ def _max_item_id(chat_items: List[Dict[str, Any]]) -> Optional[int]:
         if isinstance(raw, int) and (best is None or raw > best):
             best = raw
     return best
+
+
+def _default_file_dir() -> Path:
+    return _hermes_home() / "cache" / "simplex-files"
+
+
+def _make_image_thumbnail(path: Path) -> Optional[str]:
+    """Return a base64 data URL for an image thumbnail, or None if Pillow
+    is unavailable or the source can't be decoded."""
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:
+        return None
+    try:
+        with Image.open(path) as img:
+            img = img.convert("RGB")
+            img.thumbnail((_THUMBNAIL_MAX_PX, _THUMBNAIL_MAX_PX))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=70)
+            data = buf.getvalue()
+    except Exception as e:
+        logger.debug("simplex: thumbnail generation failed for %s: %r", path, e)
+        return None
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+
+
+def _probe_duration_seconds(path: Path) -> Optional[int]:
+    """Return integer duration of an audio/video file via ffprobe, or None."""
+    if shutil.which("ffprobe") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+    except Exception as e:
+        logger.debug("simplex: ffprobe failed for %s: %r", path, e)
+        return None
+    try:
+        return max(0, int(round(float(proc.stdout.strip()))))
+    except ValueError:
+        return None
+
+
+def _extract_video_poster(path: Path) -> Optional[str]:
+    """Return a base64 data URL for a video poster frame via ffmpeg, or None."""
+    if shutil.which("ffmpeg") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-loglevel", "error", "-y",
+                "-ss", "1", "-i", str(path),
+                "-vframes", "1",
+                "-vf", f"scale={_THUMBNAIL_MAX_PX}:-1",
+                "-f", "image2", "-",
+            ],
+            capture_output=True, timeout=15, check=True,
+        )
+    except Exception as e:
+        logger.debug("simplex: ffmpeg poster extraction failed for %s: %r", path, e)
+        return None
+    if not proc.stdout:
+        return None
+    return "data:image/jpeg;base64," + base64.b64encode(proc.stdout).decode("ascii")
+
+
+def _resolve_local_path(url_or_path: str) -> Optional[Path]:
+    """Return a local Path for a ``file://`` URL or bare path; None for http(s)."""
+    if not url_or_path:
+        return None
+    if url_or_path.startswith("file://"):
+        return Path(urllib.parse.unquote(url_or_path[7:]))
+    if "://" in url_or_path:
+        return None
+    return Path(url_or_path)
+
+
+async def _fetch_remote_to(temp_path: Path, url: str, *, timeout: float = 30.0) -> None:
+    """Download an http(s) URL to ``temp_path``. Raises on failure."""
+    def _do_fetch() -> None:
+        with urllib.request.urlopen(url, timeout=timeout) as resp, open(temp_path, "wb") as out:
+            shutil.copyfileobj(resp, out)
+    await asyncio.to_thread(_do_fetch)
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _build_outbound_msg_content(
+    kind: str, host_path: Path, caption: Optional[str]
+) -> Dict[str, Any]:
+    """Construct the msgContent dict for an outbound /_send.
+
+    Synchronous: does ffprobe/ffmpeg/PIL work; safe to call from a thread.
+    """
+    text = caption or ""
+    if kind == "image":
+        thumb = _make_image_thumbnail(host_path)
+        out: Dict[str, Any] = {"type": "image", "text": text}
+        if thumb:
+            out["image"] = thumb
+        return out
+    if kind == "file":
+        return {"type": "file", "text": text}
+    if kind == "voice":
+        out = {"type": "voice", "text": text}
+        duration = _probe_duration_seconds(host_path)
+        out["duration"] = duration if duration is not None else 0
+        return out
+    if kind == "video":
+        out = {"type": "video", "text": text}
+        duration = _probe_duration_seconds(host_path)
+        out["duration"] = duration if duration is not None else 0
+        poster = _extract_video_poster(host_path)
+        if poster:
+            out["image"] = poster
+        return out
+    raise ValueError(f"unknown media kind: {kind}")
+
+
+def _classify_msg_content(mc_type: Optional[str]) -> Tuple[Optional[MessageType], Optional[str]]:
+    """Map a simplex-chat msgContent.type to (MessageType, MIME) for inbound."""
+    if mc_type == "text":
+        return MessageType.TEXT, None
+    if mc_type == "image":
+        return MessageType.PHOTO, "image/jpeg"
+    if mc_type == "file":
+        return MessageType.DOCUMENT, "application/octet-stream"
+    if mc_type == "voice":
+        return MessageType.VOICE, "audio/ogg"
+    if mc_type == "video":
+        return MessageType.VIDEO, "video/mp4"
+    return None, None
 
 
 class SimplexAdapter(BasePlatformAdapter):
@@ -126,6 +293,23 @@ class SimplexAdapter(BasePlatformAdapter):
         self._cursors: Dict[str, int] = self._load_cursors()
         self._seen_item_ids: Deque[int] = deque(maxlen=_DEDUPE_RING_SIZE)
         self._seen_item_set: set[int] = set()
+
+        # Media: bind-mount that the daemon and Hermes both see.
+        host_dir_raw = extra.get("file_dir")
+        self._file_dir: Path = (
+            Path(host_dir_raw).expanduser() if host_dir_raw else _default_file_dir()
+        )
+        self._daemon_files_folder: str = (
+            extra.get("daemon_files_folder") or "/root/.simplex/files"
+        )
+        try:
+            self._max_file_bytes = max(
+                0, int(os.getenv("SIMPLEX_MAX_FILE_BYTES", str(_DEFAULT_MAX_FILE_BYTES)))
+            )
+        except ValueError:
+            self._max_file_bytes = _DEFAULT_MAX_FILE_BYTES
+        # Set on connect once the bind-mount is verified writable.
+        self._media_enabled: bool = False
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -233,13 +417,51 @@ class SimplexAdapter(BasePlatformAdapter):
         chat_id: str,
         image_url: str,
         caption: Optional[str] = None,
+        **kwargs,
     ) -> SendResult:
-        # v1: text only.  simplex-chat supports images via /_send with
-        # msgContent.type == "image" but the protocol is bigger and out
-        # of scope.
-        return SendResult(
-            success=False,
-            error="simplex: image send not implemented in v1",
+        return await self._send_media(
+            chat_id, image_url, caption=caption, kind="image"
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_media(
+            chat_id, file_path, caption=caption, kind="image"
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_media(
+            chat_id, file_path, caption=caption, kind="file"
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_media(chat_id, audio_path, caption=None, kind="voice")
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_url: str,
+        caption: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_media(
+            chat_id, video_url, caption=caption, kind="video"
         )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
@@ -300,6 +522,7 @@ class SimplexAdapter(BasePlatformAdapter):
             return False
 
         await self._refresh_known_groups()
+        self._verify_media_dir()
         return True
 
     async def _safe_close_client(self) -> None:
@@ -395,8 +618,10 @@ class SimplexAdapter(BasePlatformAdapter):
             return
 
         msg_content = content.get("msgContent") or {}
-        if msg_content.get("type") != "text":
-            return  # v1: text only
+        mc_type = msg_content.get("type")
+        message_type, media_mime = _classify_msg_content(mc_type)
+        if message_type is None:
+            return  # unsupported content type (link, unknown extensions)
 
         group_info = chat_info.get("groupInfo") or {}
         group_id = group_info.get("groupId")
@@ -431,6 +656,25 @@ class SimplexAdapter(BasePlatformAdapter):
             self._note_seen(item_id)
         message_id = str(item_id) if isinstance(item_id, int) else uuid4().hex
 
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        if message_type != MessageType.TEXT:
+            host_path = self._resolve_inbound_file(chat_item, gid_str)
+            if host_path is None:
+                # Either media is disabled, the file isn't downloaded yet,
+                # or it exceeded SIMPLEX_MAX_FILE_BYTES. _resolve_inbound_file
+                # has already logged the reason; downgrade to a text event so
+                # the conversation still records that something arrived.
+                fname = ((chat_item.get("file") or {}).get("fileName")) or "(file)"
+                text = (
+                    f"[simplex {message_type.value} — {fname} not delivered]"
+                    + (f" {text}" if text else "")
+                )
+                message_type = MessageType.TEXT
+            else:
+                media_urls = [str(host_path)]
+                media_types = [media_mime or "application/octet-stream"]
+
         source = self.build_source(
             chat_id=gid_str,
             chat_name=group_info.get("displayName", gid_str),
@@ -440,10 +684,12 @@ class SimplexAdapter(BasePlatformAdapter):
         )
         event_obj = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=message_type,
             source=source,
             message_id=message_id,
             raw_message=item,
+            media_urls=media_urls,
+            media_types=media_types,
         )
         try:
             await self.handle_message(event_obj)
@@ -453,6 +699,155 @@ class SimplexAdapter(BasePlatformAdapter):
 
         if isinstance(item_id, int):
             self._advance_cursor(gid_str, item_id)
+
+    # ── Outbound media ──────────────────────────────────────────────────
+
+    async def _send_media(
+        self,
+        chat_id: str,
+        source_url: str,
+        *,
+        caption: Optional[str],
+        kind: str,
+    ) -> SendResult:
+        if not self._media_enabled:
+            return SendResult(
+                success=False,
+                error=(
+                    "simplex: media disabled — bind-mount the daemon's files "
+                    "folder to SIMPLEX_FILE_DIR and restart Hermes"
+                ),
+            )
+        if self._client is None:
+            return SendResult(success=False, error="simplex: not connected", retryable=True)
+        try:
+            gid = int(chat_id)
+        except (TypeError, ValueError):
+            return SendResult(success=False, error=f"simplex: chat_id {chat_id!r} is not numeric")
+
+        try:
+            host_path, basename = await self._stage_outbound_file(source_url)
+        except Exception as e:
+            logger.warning("simplex: stage_outbound_file failed: %r", e)
+            return SendResult(success=False, error=f"simplex: cannot stage file: {e}")
+
+        if self._max_file_bytes:
+            try:
+                size = host_path.stat().st_size
+            except OSError:
+                size = 0
+            if size > self._max_file_bytes:
+                _safe_unlink(host_path)
+                return SendResult(
+                    success=False,
+                    error=f"simplex: file exceeds SIMPLEX_MAX_FILE_BYTES ({size} > {self._max_file_bytes})",
+                )
+
+        msg_content = await asyncio.to_thread(
+            _build_outbound_msg_content, kind, host_path, caption
+        )
+        container_path = self._container_path_for(basename)
+
+        async with self._send_lock:
+            try:
+                resp = await self._client.api_send_message_with_file_to_group(
+                    gid, msg_content, container_path
+                )
+            except Exception as e:
+                logger.warning("simplex: api_send_message_with_file failed: %r", e)
+                return SendResult(success=False, error=str(e), retryable=True)
+        return SendResult(
+            success=True,
+            message_id=str(resp.item_id) if resp.item_id is not None else None,
+            raw_response=resp.raw,
+        )
+
+    async def _stage_outbound_file(self, source_url: str) -> Tuple[Path, str]:
+        """Copy/download the source into SIMPLEX_FILE_DIR with a uuid-prefixed
+        name; return (host_path, basename). Raises on failure."""
+        local = _resolve_local_path(source_url)
+        if local is not None:
+            if not local.exists():
+                raise FileNotFoundError(f"source not found: {local}")
+            ext = local.suffix or ""
+            basename = f"{uuid4().hex}{ext}"
+            dest = self._file_dir / basename
+            await asyncio.to_thread(shutil.copy2, local, dest)
+            return dest, basename
+        # http(s) URL — download it
+        parsed = urllib.parse.urlparse(source_url)
+        ext = Path(parsed.path).suffix or ""
+        basename = f"{uuid4().hex}{ext}"
+        dest = self._file_dir / basename
+        await _fetch_remote_to(dest, source_url)
+        return dest, basename
+
+    def _container_path_for(self, basename: str) -> str:
+        # The daemon resolves filePath relative to its own filesystem; with
+        # the recommended bind-mount, the basename in SIMPLEX_FILE_DIR maps
+        # 1:1 into the daemon_files_folder.
+        folder = self._daemon_files_folder.rstrip("/")
+        return f"{folder}/{basename}"
+
+    # ── Inbound media ───────────────────────────────────────────────────
+
+    def _verify_media_dir(self) -> None:
+        """Ensure SIMPLEX_FILE_DIR is usable; otherwise disable media + warn."""
+        try:
+            self._file_dir.mkdir(parents=True, exist_ok=True)
+            probe = self._file_dir / ".hermes-simplex-write-test"
+            probe.write_text("ok")
+            probe.unlink()
+        except OSError as e:
+            logger.warning(
+                "simplex: media disabled — %s is not writable (%r). "
+                "Bind-mount the daemon's files folder to this host path "
+                "to enable image/file/voice/video. Text continues to work.",
+                self._file_dir, e,
+            )
+            self._media_enabled = False
+            return
+        self._media_enabled = True
+
+    def _resolve_inbound_file(
+        self, chat_item: Dict[str, Any], gid_str: str
+    ) -> Optional[Path]:
+        """Return the host path for an inbound attachment, or None if it
+        cannot be delivered (media disabled, file pending, too large)."""
+        if not self._media_enabled:
+            logger.debug("simplex: media disabled, dropping attachment in group %s", gid_str)
+            return None
+        file_envelope = chat_item.get("file") or {}
+        fname = file_envelope.get("fileName")
+        if not isinstance(fname, str) or not fname:
+            logger.debug("simplex: inbound media has no fileName")
+            return None
+        size = file_envelope.get("fileSize")
+        if isinstance(size, int) and self._max_file_bytes and size > self._max_file_bytes:
+            logger.warning(
+                "simplex: rejecting inbound file %r in group %s — %d bytes exceeds SIMPLEX_MAX_FILE_BYTES=%d",
+                fname, gid_str, size, self._max_file_bytes,
+            )
+            return None
+        status = (file_envelope.get("fileStatus") or {}).get("type")
+        if status not in {"rcvComplete", "sndStored", "sndComplete", None}:
+            # Daemon hasn't finished receiving the file yet. v2.1 will poll
+            # for completion via /freceive + a fileStatus event handler;
+            # for now, surface the gap rather than dispatch a broken path.
+            logger.info(
+                "simplex: file %r in group %s is %s — skipping (not yet downloaded)",
+                fname, gid_str, status,
+            )
+            return None
+        host_path = self._file_dir / fname
+        if not host_path.exists():
+            logger.warning(
+                "simplex: file %r reported %s but %s is missing on host — "
+                "check that SIMPLEX_FILE_DIR matches the daemon bind-mount",
+                fname, status, host_path,
+            )
+            return None
+        return host_path
 
     # ── Replay ──────────────────────────────────────────────────────────
 

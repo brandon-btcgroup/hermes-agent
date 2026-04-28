@@ -228,7 +228,30 @@ class SimplexChatClient:
         body = json.dumps(
             [{"msgContent": {"type": "text", "text": text}, "mentions": {}}]
         )
-        cmd = f"/_send #{group_id} json {body}"
+        return await self._send_to_group(group_id, body)
+
+    async def api_send_message_with_file_to_group(
+        self,
+        group_id: int,
+        msg_content: dict,
+        container_file_path: str,
+    ) -> SendResponse:
+        """Send a media message: msg_content carries the type-specific fields
+        (image thumbnail, voice/video duration, caption text); file_path is
+        the path the *daemon* sees inside its container after the bind-mount."""
+        body = json.dumps(
+            [
+                {
+                    "msgContent": msg_content,
+                    "fileSource": {"filePath": container_file_path},
+                    "mentions": {},
+                }
+            ]
+        )
+        return await self._send_to_group(group_id, body)
+
+    async def _send_to_group(self, group_id: int, body_json: str) -> SendResponse:
+        cmd = f"/_send #{group_id} json {body_json}"
         resp = await self.send_chat_cmd(cmd)
         if resp.get("type") != "newChatItems":
             raise SimplexProtocolError("expected newChatItems", resp)
