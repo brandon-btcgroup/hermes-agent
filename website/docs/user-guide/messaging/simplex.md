@@ -26,7 +26,10 @@ The SimpleX adapter pulls in [`websockets`](https://pypi.org/project/websockets/
 
 ## 1. Run the simplex-chat daemon
 
-The simplest path is Docker. Save this as `docker-compose.yml` somewhere convenient:
+### Docker Compose (text-only, simplest)
+
+For a text-only bot using SimpleX's public servers, save this as
+`docker-compose.yml`:
 
 ```yaml
 services:
@@ -34,25 +37,69 @@ services:
     image: simplexchat/simplex-chat:latest
     command:
       - "--create-bot-display-name=hermes"
+      - "--create-bot-allow-files"
+      - "--auto-accept-files"
+      - "52428800"
+      - "--files-folder"
+      - "/root/.simplex/files"
+      - "--temp-folder"
+      - "/root/.simplex/files/.xftp-tmp"
       - "-p"
       - "5225"
     ports:
-      - "5225:5225"      # expose to your trusted LAN; do NOT expose publicly
+      - "127.0.0.1:5225:5225"   # loopback only — WS has NO auth
     volumes:
       - simplex-chat-data:/root/.simplex
+      - ${HOME}/.hermes/cache/simplex-files:/root/.simplex/files
     restart: unless-stopped
 
 volumes:
   simplex-chat-data:
 ```
 
-Then:
+Then `docker compose up -d`. Why each flag:
+
+- `--create-bot-allow-files` — sets the bot profile's `files: yes` preference at creation. Without it, peer clients refuse to send attachments to the bot. (If your bot is already running without this flag, the recovery is a runtime `/set files yes` via the WS — see [Troubleshooting](#troubleshooting).)
+- `--auto-accept-files 52428800` — auto-accept incoming files up to 50 MiB. The boolean short form `-a` alone is silently a no-op in some builds; prefer the long form with an explicit byte limit.
+- `--files-folder` + `--temp-folder` — both must live on the same filesystem (the bind-mount), otherwise XFTP downloads fail with `Invalid cross-device link` when the daemon tries to atomically move the decrypted file into place. Default `--temp-folder` is `/tmp`, which causes EXDEV on any container with a separate files mount.
+
+### Quadlet / rootless Podman
+
+For Bazzite, Fedora Atomic, or any rootless-Podman host, use the
+templates in this repo:
 
 ```bash
-docker compose up -d
+cp simplex-chat-hermes.container.example   ~/.config/containers/systemd/simplex-chat-hermes.container
+cp simplex-chat-hermes.env.example         ~/.config/containers/systemd/simplex-chat-hermes.env
+$EDITOR ~/.config/containers/systemd/simplex-chat-hermes.env       # fill in SMP/XFTP URLs
+mkdir -p ~/.hermes/cache/simplex-files
+systemctl --user daemon-reload
+systemctl --user enable --now simplex-chat-hermes
 ```
 
-The daemon's WebSocket is **unauthenticated** — anyone with network access to port 5225 can read your messages and impersonate the bot. Keep it on a trusted LAN, or front it with a TLS+auth reverse proxy if you must expose it.
+The Quadlet template assumes self-hosted SMP + XFTP servers. Drop the
+`-s` and `--xftp-server` lines from `Exec=` to use SimpleX's defaults.
+
+### Self-hosted SMP and XFTP servers
+
+If you run your own SMP and XFTP servers, both URLs in your env file must
+include the cert fingerprint **and** the basic-auth token, in the form:
+
+```
+<proto>://<base64-fingerprint>:<auth-token>@<host>:<port>
+```
+
+Find the canonical URLs in your server's INI. For `smp-server`,
+`/etc/opt/simplex/smp-server.ini` has `server_address=`. For
+`xftp-server`, `/etc/opt/simplex-xftp/file-server.ini` does.
+
+The auth token gates queue / file creation on the server. Without it, the
+phone client gets `unknownServers` errors from the bot daemon when it
+tries to download attachments.
+
+See the [Security notes](#security-notes) section below for the full
+deployment caveats; the headline is that the WS port is unauthenticated
+and must stay on `127.0.0.1` (or behind a TLS+auth proxy).
 
 ---
 
@@ -198,6 +245,58 @@ The invitation handshake takes seconds-to-minutes. Wait, then re-list. If the da
 
 **Sender shows as "unknown"**
 The adapter reads `chatDir.groupMember.localDisplayName` (with a fallback to `memberProfile.displayName`). If both are empty, the sender hasn't set a profile name in SimpleX yet — set one under Settings → Your profile and resend.
+
+**Hermes replies "I didn't get the image" / pictures arrive as 0-byte files**
+You're hitting the XFTP download path. Several things have to be right:
+
+1. **Bind-mount.** The daemon's files folder must be exposed to Hermes on the host. Check `~/.hermes/cache/simplex-files/` is writable from your user *and* visible to the daemon at `/root/.simplex/files/` (or whatever `SIMPLEX_DAEMON_FILES_FOLDER` is).
+2. **Auto-accept enabled.** `podman exec simplex-chat-hermes ps -ef | grep simplex-chat` should show `--auto-accept-files <bytes>` in the args. The boolean short form `-a` alone is silently a no-op in some builds.
+3. **`--temp-folder` on the same filesystem as `--files-folder`.** If the temp folder is the default `/tmp`, XFTP downloads complete in `/tmp/` then fail to atomically rename into the bind-mounted files folder with `unsupported operation (Invalid cross-device link)`. The fix is `--temp-folder /root/.simplex/files/.xftp-tmp` (a subdir of the bind-mount).
+4. **XFTP server URL has fingerprint AND auth token.** Check `~/.config/containers/systemd/simplex-chat-hermes.env`'s `XFTP_SERVER` is `xftp://<fingerprint>:<token>@host:port`, not just `xftp://<fingerprint>@host:port`. Without the token, the daemon errors with `fileNotApproved` and `unknownServers`.
+5. **Bot profile allows files.** If the bot was created without `--create-bot-allow-files`, peer clients see the bot's `files: no` preference and refuse to send. Recovery without recreating the bot — send `/set files yes` over the daemon WS:
+
+   ```bash
+   ~/.hermes/hermes-agent/venv/bin/python -c '
+   import asyncio, json, websockets
+   async def go():
+       async with websockets.connect("ws://localhost:5225") as ws:
+           await ws.send(json.dumps({"corrId":"1","cmd":"/set files yes"}))
+           print(await asyncio.wait_for(ws.recv(), 5.0))
+   asyncio.run(go())
+   '
+   ```
+
+   Confirm by re-querying — `memberProfile.preferences.files.allow` should flip from `"no"` to `"yes"`.
+
+If the file does land on the host but Hermes still says "didn't get the image", you're hitting the dispatch race window — the photo arrived after `SIMPLEX_FILE_WAIT_S` (default 60 s). Increase that env var if your XFTP server is slow.
+
+**`fileNotApproved` errors with `unknownServers`**
+The XFTP server URL referenced by the file invitation isn't in the daemon's known-server list. Add `--xftp-server <url>` to the daemon's `Exec=` line (one-time write to its DB), then drop the flag back off — leaving it on permanently triggers `UNIQUE constraint failed: protocol_servers.user_id, protocol_servers.host, protocol_servers.port` on subsequent restarts.
+
+If the server URL was added without the basic-auth token and you need to fix the existing DB row instead of recreating it, stop the daemon and update directly:
+
+```bash
+DBROOT=$(podman volume inspect simplex-chat-hermes-data --format '{{.Mountpoint}}')
+systemctl --user stop simplex-chat-hermes
+~/.hermes/hermes-agent/venv/bin/python -c "
+import sqlite3
+con = sqlite3.connect('$DBROOT/simplex_v1_chat.db')
+con.execute(\"UPDATE protocol_servers SET basic_auth=? WHERE host=? AND port=? AND protocol=?\",
+            ('YOUR-AUTH-TOKEN', 'xftp.example.com', '5225', 'xftp'))
+con.commit()
+print(list(con.execute(\"SELECT host, port, basic_auth, protocol FROM protocol_servers\")))
+"
+systemctl --user start simplex-chat-hermes
+```
+
+**Inbound queue silent after a daemon restart**
+After multiple back-to-back daemon restarts, the bot's SMP queue subscriptions can take 30 s – several minutes to re-establish. If text messages from your phone aren't reaching Hermes (and `journalctl --user -u hermes-gateway` shows no `simplex` activity), wait a few minutes; the subscription usually catches up. If it doesn't, restart the daemon one more time — the next clean startup re-subscribes all queues.
+
+**Daemon won't start with `UNIQUE constraint failed: protocol_servers`**
+The `--smp-server` or `--xftp-server` flag is trying to insert a server URL that already exists in the daemon's DB but with different details (auth token added/changed). Remove the offending flag from `Exec=`; the existing entry is what gets used. If you need to *update* the URL of an existing entry, do it with a SQLite `UPDATE` (see the snippet above) rather than re-passing the flag.
+
+**`commitBuffer: invalid argument (cannot encode character ...)`**
+Cosmetic only — simplex-chat tried to print a Unicode character (em-dash, emoji) to a stdout stream that doesn't support it. Doesn't affect message delivery.
 
 ---
 
