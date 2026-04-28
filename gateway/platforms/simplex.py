@@ -20,24 +20,25 @@ v1 scope (text + groups only):
   - Allowlist enforced on the sender's display name
     (SIMPLEX_ALLOWED_USERS), with the same shape as Signal/WhatsApp.
 
+Missed-message replay across Hermes restarts: per-group last-dispatched
+itemId is persisted at ``$HERMES_HOME/simplex/cursors.json``; on reconnect
+the adapter walks ``/_get chat #<gid> after=<id> count=N`` forward until
+the daemon returns no more items or ``SIMPLEX_REPLAY_MAX`` is hit.
+
 Known v1 gaps (tracked for v1.1):
   - No images / files / voice / typing indicators / streaming edits.
-  - No missed-message replay across Hermes restarts. simplex-chat
-    persists messages received during downtime in its own DB but does
-    not re-emit them to a re-connecting WS client. The user sees a
-    delivered message but Hermes doesn't process it. To close this gap
-    we'd need to call ``/_get_chat #<gid> count=N`` after reconnect and
-    filter by a persisted ``last_seen_item_id`` per group — deferred
-    until we can validate the response shape against a real daemon.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
-from typing import Any, Dict, List, Optional
+from collections import deque
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional
 from uuid import uuid4
 
 from gateway.config import Platform, PlatformConfig
@@ -58,10 +59,34 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 4000
 
+# Hard cap on the in-memory dedupe set; bounds memory regardless of traffic.
+_DEDUPE_RING_SIZE = 1024
+
+# Replay paginates /_get chat in batches of this size.
+_REPLAY_PAGE_SIZE = 50
+
 
 def check_simplex_requirements() -> bool:
     """Return True iff the env has enough config for the SimpleX adapter."""
     return bool(os.getenv("SIMPLEX_WS_URL") and os.getenv("SIMPLEX_GROUP_IDS"))
+
+
+def _hermes_home() -> Path:
+    return Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes")
+
+
+def _cursor_file_path() -> Path:
+    return _hermes_home() / "simplex" / "cursors.json"
+
+
+def _max_item_id(chat_items: List[Dict[str, Any]]) -> Optional[int]:
+    best: Optional[int] = None
+    for entry in chat_items:
+        meta = (entry.get("meta") or {}) if isinstance(entry, dict) else {}
+        raw = meta.get("itemId")
+        if isinstance(raw, int) and (best is None or raw > best):
+            best = raw
+    return best
 
 
 class SimplexAdapter(BasePlatformAdapter):
@@ -87,6 +112,21 @@ class SimplexAdapter(BasePlatformAdapter):
         self._known_groups: Dict[int, str] = {}
         self._self_display_name: str = ""
 
+        # Replay state: per-group last-dispatched itemId persisted to disk,
+        # plus an in-memory ring of recently-dispatched ids that lets replay
+        # and the live stream coexist without double-processing.
+        self._replay_disabled = (
+            os.getenv("SIMPLEX_REPLAY_DISABLE", "").strip().lower() in {"1", "true", "yes"}
+        )
+        try:
+            self._replay_max = max(0, int(os.getenv("SIMPLEX_REPLAY_MAX", "200")))
+        except ValueError:
+            self._replay_max = 200
+        self._cursor_path: Path = _cursor_file_path()
+        self._cursors: Dict[str, int] = self._load_cursors()
+        self._seen_item_ids: Deque[int] = deque(maxlen=_DEDUPE_RING_SIZE)
+        self._seen_item_set: set[int] = set()
+
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     async def connect(self) -> bool:
@@ -108,6 +148,7 @@ class SimplexAdapter(BasePlatformAdapter):
         self._stopping = False
         if not await self._connect_once():
             return False
+        await self._replay_missed_messages()
         self._supervisor_task = asyncio.create_task(
             self._supervisor(), name="simplex-supervisor"
         )
@@ -314,6 +355,7 @@ class SimplexAdapter(BasePlatformAdapter):
 
             if await self._connect_once():
                 delay = self._initial_reconnect_delay
+                await self._replay_missed_messages()
                 self._mark_connected()
                 logger.info("simplex: reconnected to %s", self._ws_url)
             else:
@@ -381,6 +423,12 @@ class SimplexAdapter(BasePlatformAdapter):
         text = msg_content.get("text") or ""
         meta = chat_item.get("meta") or {}
         item_id = meta.get("itemId")
+        # Dedupe: replay and the live stream can both surface the same
+        # itemId in the seam around reconnect; let the first one win.
+        if isinstance(item_id, int):
+            if item_id in self._seen_item_set:
+                return
+            self._note_seen(item_id)
         message_id = str(item_id) if isinstance(item_id, int) else uuid4().hex
 
         source = self.build_source(
@@ -401,3 +449,127 @@ class SimplexAdapter(BasePlatformAdapter):
             await self.handle_message(event_obj)
         except Exception as e:
             logger.exception("simplex: handle_message raised: %r", e)
+            return
+
+        if isinstance(item_id, int):
+            self._advance_cursor(gid_str, item_id)
+
+    # ── Replay ──────────────────────────────────────────────────────────
+
+    def _note_seen(self, item_id: int) -> None:
+        if len(self._seen_item_ids) == self._seen_item_ids.maxlen:
+            evicted = self._seen_item_ids[0]
+            self._seen_item_set.discard(evicted)
+        self._seen_item_ids.append(item_id)
+        self._seen_item_set.add(item_id)
+
+    def _advance_cursor(self, gid_str: str, item_id: int) -> None:
+        prev = self._cursors.get(gid_str)
+        if prev is not None and prev >= item_id:
+            return
+        self._cursors[gid_str] = item_id
+        self._save_cursors()
+
+    def _load_cursors(self) -> Dict[str, int]:
+        try:
+            raw = self._cursor_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        except OSError as e:
+            logger.warning("simplex: failed to read cursor file %s: %r", self._cursor_path, e)
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("simplex: cursor file %s is corrupt; ignoring", self._cursor_path)
+            return {}
+        groups = data.get("groups") if isinstance(data, dict) else None
+        if not isinstance(groups, dict):
+            return {}
+        out: Dict[str, int] = {}
+        for k, v in groups.items():
+            if isinstance(v, int):
+                out[str(k)] = v
+        return out
+
+    def _save_cursors(self) -> None:
+        try:
+            self._cursor_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._cursor_path.with_suffix(self._cursor_path.suffix + ".tmp")
+            payload = json.dumps({"version": 1, "groups": self._cursors}, sort_keys=True)
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, self._cursor_path)
+        except OSError as e:
+            logger.warning("simplex: failed to write cursor file %s: %r", self._cursor_path, e)
+
+    async def _replay_missed_messages(self) -> None:
+        """Walk /_get chat forward from each group's cursor and dispatch."""
+        if self._replay_disabled or self._client is None:
+            return
+        for gid_str in sorted(self._allowed_group_ids):
+            try:
+                gid = int(gid_str)
+            except ValueError:
+                continue
+            after_id = self._cursors.get(gid_str)
+            if after_id is None:
+                # First connect for this group: seed the cursor at the most
+                # recent item without dispatching anything, so we don't
+                # replay the entire history on initial install.
+                await self._seed_cursor(gid, gid_str)
+                continue
+            await self._replay_group(gid, gid_str, after_id)
+
+    async def _seed_cursor(self, gid: int, gid_str: str) -> None:
+        if self._client is None:
+            return
+        try:
+            items = await self._client.api_get_chat(group_id=gid, count=1)
+        except Exception as e:
+            logger.warning("simplex: cursor seed failed for group %s: %r", gid_str, e)
+            return
+        latest = _max_item_id(items)
+        if latest is not None:
+            self._cursors[gid_str] = latest
+            self._save_cursors()
+
+    async def _replay_group(self, gid: int, gid_str: str, after_id: int) -> None:
+        assert self._client is not None
+        replayed = 0
+        cursor = after_id
+        remaining = self._replay_max
+        while remaining > 0:
+            page_size = min(_REPLAY_PAGE_SIZE, remaining)
+            try:
+                items = await self._client.api_get_chat(
+                    group_id=gid, count=page_size, after_id=cursor
+                )
+            except Exception as e:
+                logger.warning("simplex: replay fetch failed for group %s: %r", gid_str, e)
+                return
+            if not items:
+                break
+            chat_info = {
+                "type": "group",
+                "groupInfo": {
+                    "groupId": gid,
+                    "displayName": self._known_groups.get(gid, gid_str),
+                },
+            }
+            for chat_item in items:
+                await self._dispatch_chat_item({"chatInfo": chat_info, "chatItem": chat_item})
+                replayed += 1
+            new_cursor = _max_item_id(items)
+            if new_cursor is None or new_cursor <= cursor:
+                break
+            cursor = new_cursor
+            remaining -= len(items)
+            if len(items) < page_size:
+                break
+        if replayed:
+            logger.info(
+                "simplex: replayed %d missed message(s) in group %s%s",
+                replayed,
+                gid_str,
+                " (capped)" if replayed >= self._replay_max else "",
+            )

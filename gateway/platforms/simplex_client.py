@@ -199,6 +199,29 @@ class SimplexChatClient:
     async def api_connect(self, invitation_link: str) -> dict:
         return await self.send_chat_cmd(f"/c {invitation_link}")
 
+    async def api_get_chat(
+        self,
+        *,
+        group_id: int,
+        count: int = 50,
+        after_id: Optional[int] = None,
+    ) -> list[dict]:
+        """Return ChatItems for a group, optionally paginated after an item id.
+
+        Each entry is a bare ``chatItem`` (no ``chatInfo``); the caller wraps
+        it with the group's ``chatInfo`` before feeding the dispatcher, which
+        expects the same shape as live ``newChatItems`` events.
+        """
+        if after_id is not None:
+            cmd = f"/_get chat #{group_id} after={after_id} count={count}"
+        else:
+            cmd = f"/_get chat #{group_id} count={count}"
+        resp = await self.send_chat_cmd(cmd)
+        if resp.get("type") != "apiChat":
+            raise SimplexProtocolError("expected apiChat", resp)
+        chat = resp.get("chat") or {}
+        return chat.get("chatItems") or []
+
     async def api_send_text_message_to_group(
         self, group_id: int, text: str
     ) -> SendResponse:

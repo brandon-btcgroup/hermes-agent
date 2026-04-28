@@ -120,6 +120,7 @@ Send a message in the group from your phone. Hermes should reply within a few se
 - Allowlist on the sender's display name (`SIMPLEX_ALLOWED_USERS`).
 - Automatic reconnection if the daemon restarts or the network blips.
 - Cron delivery: `cronjob action="create" deliver="simplex" target="<group_id>" ...`.
+- Missed-message replay across Hermes restarts. On reconnect, the adapter walks `/_get chat` forward from a per-group cursor stored at `~/.hermes/simplex/cursors.json` and dispatches anything new, capped by `SIMPLEX_REPLAY_MAX` (default 200).
 
 ## What's not in v1
 
@@ -128,8 +129,6 @@ Send a message in the group from your phone. Hermes should reply within a few se
 - **Streaming replies via message edits.** `apiUpdateChatItem` exists at the protocol level, but how SimpleX phone clients render in-place edits is unverified. Tracked for v1.1+ behind a real-device test.
 - **Reactions.** Need to verify protocol support before scoping.
 - **Typing indicators.** Permanent gap — simplex-chat itself has no typing API. Not an adapter limitation; would require upstream simplex-chat to add it.
-- **Missed-message replay across Hermes downtime.** simplex-chat stores messages it received while Hermes was offline but does not re-emit them when a fresh WS client connects. The user sees a delivered message but Hermes never processes it. Workaround: keep Hermes running. A proper fix (replay via `/_get_chat` on reconnect) is tracked for v1.1.
-
 ## Security notes
 
 - The daemon's WS port is unauthenticated by design — simplex-chat assumes the network path is trusted (loopback or LAN). Anyone on that network can read your group messages and send messages as the bot. Treat `:5225` exposure with the same care as a database port.
@@ -164,3 +163,5 @@ The adapter reads `chatDir.groupMember.localDisplayName` (with a fallback to `me
 | `SIMPLEX_ALLOW_ALL_USERS` | no | `true` to disable the allowlist (not recommended) |
 | `SIMPLEX_HOME_GROUP_ID` | no | Default group for cron deliveries with `deliver=simplex` and no target |
 | `SIMPLEX_MAX_RECONNECT_DELAY_S` | no | Cap on exponential backoff between reconnect attempts (default 60) |
+| `SIMPLEX_REPLAY_MAX` | no | Maximum missed messages replayed per group on reconnect (default 200) |
+| `SIMPLEX_REPLAY_DISABLE` | no | `true` to skip missed-message replay entirely |
