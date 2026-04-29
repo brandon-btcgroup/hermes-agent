@@ -88,7 +88,7 @@ Total slice 2: ~1.5 days.
 
 - **Bind-mount path drift.** If users follow our docs but the daemon is configured with a non-default file dir (`-f`), mount mapping breaks silently. Mitigation: doc it loudly, and have the adapter compare a daemon-reported path (via `/_files_folder` if it exists, else config) against `SIMPLEX_FILE_DIR` on connect.
 - **File auto-receive flag.** simplex-chat has a per-user setting for auto-receiving files. If the daemon was started without it, every inbound file needs an explicit `/_set_file_to_receive`. Build for the explicit path; auto-receive becomes an optimization.
-- **Volume-mount permissions on rootless Podman.** The daemon's `/root/.simplex/files` is owned inside the container; the host bind target may be `ai-admin`-owned. UID mapping needs to be verified in the Bazzite Quadlet template.
+- **Volume-mount permissions on rootless Podman.** The daemon's `/root/.simplex/files` is owned inside the container; the host bind target is owned by the gateway-running user. UID mapping needs to be verified in the Quadlet template.
 
 ## Sequencing
 

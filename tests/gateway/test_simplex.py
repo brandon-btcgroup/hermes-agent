@@ -105,7 +105,7 @@ async def test_connect_fails_without_group_ids():
 # ── Event filter (dispatch) ──────────────────────────────────────────────
 
 
-def _group_rcv_text(group_id, text="hi", sender="brandon", item_id=42):
+def _group_rcv_text(group_id, text="hi", sender="alice", item_id=42):
     return {
         "chatInfo": {
             "type": "group",
@@ -148,7 +148,7 @@ async def test_dispatch_routes_groupRcv_text():
     assert ev.text == "hello there"
     assert ev.source.platform == Platform.SIMPLEX
     assert ev.source.chat_id == "12"
-    assert ev.source.user_id == "brandon"
+    assert ev.source.user_id == "alice"
     assert ev.message_id == "42"
 
 
@@ -401,7 +401,7 @@ class _ReplayClient:
         return SendResponse(item_id=None, raw={})
 
 
-def _replay_item(item_id, text="hi", sender="brandon"):
+def _replay_item(item_id, text="hi", sender="alice"):
     """A bare chatItem (no chatInfo) — what /_get chat returns."""
     return {
         "chatDir": {
@@ -773,8 +773,8 @@ def _bare_image_chat_item(item_id, file_id, file_name, status):
         "chatDir": {
             "type": "groupRcv",
             "groupMember": {
-                "localDisplayName": "brandon",
-                "memberProfile": {"displayName": "brandon"},
+                "localDisplayName": "alice",
+                "memberProfile": {"displayName": "alice"},
             },
         },
         "content": {"type": "rcvMsgContent", "msgContent": {"type": "image", "text": ""}},
