@@ -1,0 +1,11 @@
+name: simplex-platform
+kind: platform
+version: 1.0.0
+description: >
+  SimpleX Chat gateway adapter for Hermes Agent.
+  Connects to a simplex-chat daemon over WebSocket and relays messages
+  between SimpleX groups (or DMs) and the Hermes agent.  Privacy-focused,
+  decentralized messaging with no phone numbers or central identifiers.
+author: Brandon Jones
+requires_env:
+  - SIMPLEX_WS_URL
