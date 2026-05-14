@@ -279,6 +279,13 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `SIGNAL_HOME_CHANNEL_NAME` | Display name for the Signal home channel |
 | `SIGNAL_IGNORE_STORIES` | Ignore Signal stories/status updates |
 | `SIGNAL_ALLOW_ALL_USERS` | Allow all Signal users without an allowlist |
+| `SIMPLEX_WS_URL` | WebSocket URL of the simplex-chat daemon (for example `ws://localhost:5225`) |
+| `SIMPLEX_GROUP_IDS` | Comma-separated numeric SimpleX group IDs Hermes should listen in (populate via `hermes simplex join`) |
+| `SIMPLEX_HOME_GROUP_ID` | Default group ID for cron deliveries with `deliver=simplex` and no target |
+| `SIMPLEX_HOME_GROUP_NAME` | Display name for the SimpleX home group |
+| `SIMPLEX_ALLOWED_USERS` | Comma-separated SimpleX display names allowed to chat |
+| `SIMPLEX_ALLOW_ALL_USERS` | Allow all SimpleX senders without an allowlist |
+| `SIMPLEX_MAX_RECONNECT_DELAY_S` | Cap on exponential backoff between reconnect attempts (default `60`) |
 | `TWILIO_ACCOUNT_SID` | Twilio Account SID (shared with telephony skill) |
 | `TWILIO_AUTH_TOKEN` | Twilio Auth Token (shared with telephony skill; also used for webhook signature validation) |
 | `TWILIO_PHONE_NUMBER` | Twilio phone number in E.164 format (shared with telephony skill) |

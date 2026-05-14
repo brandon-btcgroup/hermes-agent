@@ -1,0 +1,84 @@
+# Quadlet unit for running a dedicated simplex-chat daemon for Hermes.
+#
+# Copy to ~/.config/containers/systemd/simplex-chat-hermes.container, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now simplex-chat-hermes
+#
+# Companion env file: simplex-chat-hermes.env (alongside this file).
+#
+# This template assumes self-hosted SMP + XFTP servers. To use SimpleX's
+# default public servers, drop the -s and --xftp-server lines from Exec=.
+
+[Unit]
+Description=simplex-chat daemon (dedicated to Hermes)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+# Upstream image. If you maintain a customised build, swap the Image= line
+# to your local tag (e.g. localhost/simplex-chat-hermes:latest).
+Image=docker.io/simplexchat/simplex-chat:latest
+ContainerName=simplex-chat-hermes
+
+# Bind-mount: file attachments. Hermes reads from the host side; the daemon
+# writes to the container side. Must be on the SAME filesystem as
+# --temp-folder below to avoid "Invalid cross-device link" rename errors
+# during XFTP downloads.
+Volume=%h/.hermes/cache/simplex-files:/root/.simplex/files:Z
+
+# Persist profile / keys / SQLite DB across restarts. Podman auto-creates
+# the named volume on first run.
+Volume=simplex-chat-hermes-data:/root/.simplex
+
+# Loopback only — simplex-chat's WS protocol has NO authentication. Anyone
+# who can reach this port can read every message and impersonate the bot.
+# Keep it on 127.0.0.1 unless you have a TLS+auth reverse proxy in front.
+PublishPort=127.0.0.1:5225:5225
+
+# Server URLs and any future overrides live in the env file alongside this
+# unit. See simplex-chat-hermes.env.example.
+EnvironmentFile=%h/.config/containers/systemd/simplex-chat-hermes.env
+
+# Daemon flags. Notes on each:
+#   --create-bot-display-name=hermes
+#       Names the bot user. Run-once on first start.
+#   --create-bot-allow-files
+#       Sets the bot profile's "files: yes" preference at creation time.
+#       If your bot was already created without this flag, peer clients
+#       have cached "files: no" and won't send attachments to the bot.
+#       Fix at runtime by sending "/set files yes" via the WS API; see
+#       the SimpleX setup guide for the script.
+#   -s / --xftp-server
+#       Self-hosted SMP and XFTP server URLs. Both URLs need the cert
+#       fingerprint AND the basic-auth token (the part after the ':' in
+#       fingerprint:token@host:port).
+#   --auto-accept-files <BYTES>
+#       Auto-accepts incoming files up to the given size. The boolean
+#       short form (-a alone) is silently a no-op in some builds; prefer
+#       the long form with an explicit byte limit.
+#   --files-folder /root/.simplex/files
+#       Where the daemon stores received attachments. Must match the
+#       container side of the bind-mount above.
+#   --temp-folder /root/.simplex/files/.xftp-tmp
+#       Where the daemon stages and decrypts XFTP transfers. Must be on
+#       the SAME filesystem as --files-folder so the final rename(2)
+#       succeeds. Default /tmp causes EXDEV "Invalid cross-device link".
+#   -l info
+#       Surfaces SMP / XFTP / file-transfer events to stdout for
+#       `podman logs simplex-chat-hermes`. Useful when diagnosing.
+Exec=--create-bot-display-name=hermes \
+     --create-bot-allow-files \
+     -s ${SMP_SERVER} \
+     --xftp-server ${XFTP_SERVER} \
+     --auto-accept-files 52428800 \
+     --files-folder /root/.simplex/files \
+     --temp-folder /root/.simplex/files/.xftp-tmp \
+     -l info
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=900
+EnvironmentFile=%h/.config/containers/systemd/simplex-chat-hermes.env
+
+[Install]
+WantedBy=default.target
