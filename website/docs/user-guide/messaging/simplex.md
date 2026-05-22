@@ -60,6 +60,22 @@ SIMPLEX_HOME_CHANNEL=<contact-id>
 
 After starting the daemon, open a conversation with your agent contact. The contact ID will appear in session logs or via `hermes send_message action=list`.
 
+You can also enumerate everything the daemon already knows about with:
+
+```bash
+hermes simplex list
+```
+
+This prints the active user, every contact (with numeric `contactId`), and every joined group (with numeric `groupId`). Copy IDs from the output into `SIMPLEX_HOME_CHANNEL` (for cron-delivery defaults) or `SIMPLEX_ALLOWED_USERS` (the allowlist).
+
+To join a new group via an invitation link without leaving the terminal:
+
+```bash
+hermes simplex join "https://simplex.chat/contact#..."
+```
+
+The command polls until the new group materialises (default 120s), then prints the new `groupId`. Both commands honour `SIMPLEX_WS_URL` from `~/.hermes/.env`; override per-invocation with `--ws-url`.
+
 ## Authorization
 
 By default **all contacts are denied**. You must either:
