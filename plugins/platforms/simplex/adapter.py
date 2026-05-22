@@ -24,6 +24,11 @@ Optional environment variables:
     SIMPLEX_ALLOW_ALL_USERS    Set 'true' to allow all contacts
     SIMPLEX_HOME_CHANNEL       Default contact/group ID for cron delivery
     SIMPLEX_HOME_CHANNEL_NAME  Human label for the home channel
+    SIMPLEX_REPLAY_DISABLED    Set 'true' to disable missed-message replay
+                               on reconnect (default: enabled).
+    SIMPLEX_REPLAY_MAX_ITEMS   Cap on items replayed per group per
+                               reconnect (default: 200).
+    SIMPLEX_REPLAY_PAGE_SIZE   Pagination size for /_get chat (default: 50).
 
 The ``websockets`` Python package is imported lazily — the plugin is
 discoverable and `hermes setup` can describe it even when websockets is
@@ -38,6 +43,7 @@ import os
 import random
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # Lazy import: BasePlatformAdapter and friends live in the main repo.
@@ -68,6 +74,11 @@ HEALTH_CHECK_STALE_THRESHOLD = 120.0
 
 # Correlation ID prefix for requests we send so we can ignore our own echoes.
 _CORR_PREFIX = "hermes-"
+
+# Replay defaults — overridable via SIMPLEX_REPLAY_* env vars.
+_REPLAY_DEFAULT_MAX_ITEMS = 200
+_REPLAY_DEFAULT_PAGE_SIZE = 50
+_REPLAY_RESPONSE_TIMEOUT_S = 15.0
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +149,31 @@ class SimplexAdapter(BasePlatformAdapter):
         self._pending_corr_ids: set = set()
         self._max_pending_corr = 200
 
+        # corrId → Future for requests where we actually want the response
+        # (replay's /groups and /_get chat). Echoes still go through
+        # _pending_corr_ids; only callers of _send_and_wait insert here.
+        self._pending_responses: Dict[str, asyncio.Future] = {}
+
+        # Missed-message replay state — initialised lazily on first connect
+        # so importing the module without HERMES_HOME doesn't touch disk.
+        self._replay_disabled = (
+            os.getenv("SIMPLEX_REPLAY_DISABLED", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        try:
+            self._replay_max_items = max(
+                0, int(os.getenv("SIMPLEX_REPLAY_MAX_ITEMS", str(_REPLAY_DEFAULT_MAX_ITEMS)))
+            )
+        except ValueError:
+            self._replay_max_items = _REPLAY_DEFAULT_MAX_ITEMS
+        try:
+            self._replay_page_size = max(
+                1, int(os.getenv("SIMPLEX_REPLAY_PAGE_SIZE", str(_REPLAY_DEFAULT_PAGE_SIZE)))
+            )
+        except ValueError:
+            self._replay_page_size = _REPLAY_DEFAULT_PAGE_SIZE
+        self._replay_state = None  # set in connect()
+
         logger.info("SimpleX adapter initialized: url=%s", self.ws_url)
 
     # ------------------------------------------------------------------
@@ -170,11 +206,34 @@ class SimplexAdapter(BasePlatformAdapter):
 
         self._running = True
         self._last_ws_activity = time.time()
+        self._init_replay_state()
         self._ws_task = asyncio.create_task(self._ws_listener())
         self._health_task = asyncio.create_task(self._health_monitor())
 
         logger.info("SimpleX: connected to %s", self.ws_url)
         return True
+
+    def _init_replay_state(self) -> None:
+        """Set up _replay_state lazily — needs HERMES_HOME, may not be safe
+        to call from __init__ during plugin discovery."""
+        if self._replay_disabled or self._replay_state is not None:
+            return
+        try:
+            from hermes_constants import get_hermes_home
+            cursor_path = get_hermes_home() / "simplex" / "cursors.json"
+        except Exception as e:
+            logger.warning(
+                "SimpleX: replay disabled — could not resolve HERMES_HOME: %s", e
+            )
+            self._replay_disabled = True
+            return
+        from ._replay import ReplayState
+        state = ReplayState(cursor_path)
+        try:
+            state.load()
+        except Exception:
+            logger.exception("SimpleX: replay cursor load failed; continuing fresh")
+        self._replay_state = state
 
     async def disconnect(self) -> None:
         """Stop WebSocket listener and clean up."""
@@ -205,6 +264,13 @@ class SimplexAdapter(BasePlatformAdapter):
                 pass
             self._ws = None
 
+        # Fail any awaiters that were waiting on a response so they don't
+        # hang past disconnect.
+        for fut in list(self._pending_responses.values()):
+            if not fut.done():
+                fut.cancel()
+        self._pending_responses.clear()
+
         logger.info("SimpleX: disconnected")
 
     # ------------------------------------------------------------------
@@ -230,6 +296,18 @@ class SimplexAdapter(BasePlatformAdapter):
                     backoff = WS_RETRY_DELAY_INITIAL
                     self._last_ws_activity = time.time()
                     logger.info("SimpleX WS: connected")
+
+                    # Replay missed messages before processing live events.
+                    # Failures are logged and skipped — replay is best-effort.
+                    if self._replay_state is not None:
+                        try:
+                            await self._replay_missed_items()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                "SimpleX: replay failed; continuing with live stream"
+                            )
 
                     async for raw in ws:
                         if not self._running:
@@ -295,10 +373,14 @@ class SimplexAdapter(BasePlatformAdapter):
         """Dispatch a daemon event to the appropriate handler."""
         resp_type = event.get("type") or event.get("resp", {}).get("type", "")
 
-        # Filter responses to our own commands (echoes)
+        # Responses to our own commands carry a hermes- corrId. Resolve any
+        # pending Future for /_send_and_wait callers; otherwise drop as echo.
         corr_id = event.get("corrId", "")
         if corr_id and corr_id.startswith(_CORR_PREFIX):
             self._pending_corr_ids.discard(corr_id)
+            fut = self._pending_responses.pop(corr_id, None)
+            if fut is not None and not fut.done():
+                fut.set_result(event)
             return
 
         if resp_type == "newChatItem":
@@ -426,6 +508,27 @@ class SimplexAdapter(BasePlatformAdapter):
             raw_message=wrapper,
         )
 
+        # Replay dedupe: groups only (item ids aren't unique across chats,
+        # and DM replay isn't implemented yet). Skip if we've already seen
+        # this (group_id, item_id) tuple in the dedupe ring, otherwise mark
+        # and dispatch. The cursor advances after a successful dispatch so
+        # a crash mid-handler doesn't skip the message on next start.
+        if self._replay_state is not None and is_group:
+            try:
+                gid_int = int(group_id)
+                item_id_raw = meta.get("itemId")
+                item_id_int = int(item_id_raw) if item_id_raw is not None else None
+            except (TypeError, ValueError):
+                gid_int = None
+                item_id_int = None
+            if gid_int is not None and item_id_int is not None:
+                if self._replay_state.already_dispatched(gid_int, item_id_int):
+                    return
+                self._replay_state.mark_dispatched(gid_int, item_id_int)
+                await self.handle_message(event_obj)
+                self._replay_state.update_cursor(gid_int, item_id_int)
+                return
+
         await self.handle_message(event_obj)
 
     async def _fetch_file(self, file_id: Any, file_name: str) -> Optional[str]:
@@ -493,6 +596,108 @@ class SimplexAdapter(BasePlatformAdapter):
             logger.warning("SimpleX: WS closed while sending")
         except Exception as e:
             logger.warning("SimpleX: WS send error: %s", e)
+
+    async def _send_and_wait(
+        self, cmd_str: str, *, timeout: float = _REPLAY_RESPONSE_TIMEOUT_S
+    ) -> Optional[dict]:
+        """Send a chat command and await the response with the matching corrId.
+
+        Returns the full response dict (with corrId, resp, etc.) or None on
+        timeout / WS-closed. Used by the replay loop; not exposed for normal
+        message-sending which stays fire-and-forget.
+        """
+        if not self._ws:
+            return None
+        corr_id = self._make_corr_id()
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_responses[corr_id] = fut
+        try:
+            await self._send_ws({"corrId": corr_id, "cmd": cmd_str})
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending_responses.pop(corr_id, None)
+            logger.debug("SimpleX: response timeout for %r", cmd_str)
+            return None
+        except Exception as e:
+            self._pending_responses.pop(corr_id, None)
+            logger.debug("SimpleX: _send_and_wait failed for %r: %s", cmd_str, e)
+            return None
+
+    # ------------------------------------------------------------------
+    # Missed-message replay
+    # ------------------------------------------------------------------
+
+    async def _replay_missed_items(self) -> None:
+        """Replay missed messages for each group with a stored cursor.
+
+        Idempotent across reconnects — dispatched items go through the
+        same dedupe ring as live events. Replay is per-group only; DM
+        replay would need contact-id cursors which this PR doesn't add.
+        """
+        state = self._replay_state
+        if state is None:
+            return
+        cursors = state.known_groups()
+        if not cursors:
+            logger.debug("SimpleX: no replay cursors, skipping replay")
+            return
+        logger.info("SimpleX: replaying missed items for %d group(s)", len(cursors))
+        for group_id in cursors:
+            cursor = state.get_cursor(group_id)
+            if cursor is None:
+                continue
+            try:
+                await self._replay_group(group_id, cursor)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("SimpleX: replay failed for group %s", group_id)
+
+    async def _replay_group(self, group_id: int, after_id: int) -> None:
+        """Fetch and dispatch chatItems for one group after the cursor."""
+        page_size = self._replay_page_size
+        max_items = self._replay_max_items
+        dispatched = 0
+        next_after = after_id
+        while dispatched < max_items and self._running:
+            count = min(page_size, max_items - dispatched)
+            cmd = f"/_get chat #{group_id} after={next_after} count={count}"
+            resp = await self._send_and_wait(cmd)
+            if resp is None:
+                return
+            inner = resp.get("resp") or {}
+            if inner.get("type") != "apiChat":
+                logger.debug(
+                    "SimpleX: replay group %s expected apiChat, got %r",
+                    group_id, inner.get("type"),
+                )
+                return
+            chat = inner.get("chat") or {}
+            chat_info = chat.get("chatInfo") or {}
+            items = chat.get("chatItems") or []
+            if not items:
+                return
+            for chat_item in items:
+                meta = chat_item.get("meta") or {}
+                item_id = meta.get("itemId")
+                if isinstance(item_id, int) and item_id > next_after:
+                    next_after = item_id
+                # Wrap into the shape _handle_new_chat_item expects (chatInfo
+                # alongside the bare chatItem from the /_get response).
+                wrapper = {"chatInfo": chat_info, "chatItem": chat_item}
+                await self._handle_new_chat_item(wrapper)
+                dispatched += 1
+                if dispatched >= max_items:
+                    break
+            if len(items) < count:
+                # Caught up — daemon returned fewer than requested.
+                return
+        if dispatched:
+            logger.info(
+                "SimpleX: replayed %d item(s) for group %s (cursor now %s)",
+                dispatched, group_id, next_after,
+            )
 
     async def send(
         self,
