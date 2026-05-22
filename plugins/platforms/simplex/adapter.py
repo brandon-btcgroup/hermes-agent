@@ -29,6 +29,19 @@ Optional environment variables:
     SIMPLEX_REPLAY_MAX_ITEMS   Cap on items replayed per group per
                                reconnect (default: 200).
     SIMPLEX_REPLAY_PAGE_SIZE   Pagination size for /_get chat (default: 50).
+    SIMPLEX_FILE_DIR           Host directory where the daemon's files
+                               are visible. Used when simplex-chat runs
+                               in a container and writes attachments to
+                               a bind-mounted volume that Hermes can
+                               read directly. Falls back to
+                               ~/Downloads, ~/.simplex/files,
+                               /tmp/simplex_files if unset.
+    SIMPLEX_DAEMON_FILES_FOLDER The container-side path the daemon
+                               reports for files in chat events.
+                               Defaults to /root/.simplex/files. Used
+                               together with SIMPLEX_FILE_DIR to
+                               translate daemon paths to host paths
+                               (prefix replacement).
 
 The ``websockets`` Python package is imported lazily — the plugin is
 discoverable and `hermes setup` can describe it even when websockets is
@@ -119,6 +132,39 @@ def _is_audio_ext(ext: str) -> bool:
     return ext.lower() in {".mp3", ".wav", ".ogg", ".m4a", ".aac"}
 
 
+def _translate_daemon_path(
+    daemon_path: str,
+    *,
+    host_root: Optional[str],
+    daemon_root: Optional[str],
+) -> Optional[Path]:
+    """Map a daemon-reported file path to the corresponding host path.
+
+    Returns None if translation isn't possible (either env var unset, or
+    the daemon path doesn't sit under daemon_root). The caller falls
+    back to the legacy search-known-dirs flow.
+    """
+    if not daemon_path or not host_root or not daemon_root:
+        return None
+    # Normalise trailing separators so the prefix compare is exact.
+    d_root = daemon_root.rstrip("/\\")
+    if not (daemon_path == d_root or daemon_path.startswith(d_root + "/")):
+        return None
+    suffix = daemon_path[len(d_root):].lstrip("/")
+    host = Path(host_root).expanduser() / suffix if suffix else Path(host_root).expanduser()
+    return host
+
+
+def _cache_by_ext(data: bytes, file_name: str) -> str:
+    """Route bytes to the right cache helper based on magic-byte sniffing."""
+    ext = _guess_extension(data)
+    if _is_image_ext(ext):
+        return cache_image_from_bytes(data, ext)
+    if _is_audio_ext(ext):
+        return cache_audio_from_bytes(data, ext)
+    return cache_document_from_bytes(data, file_name)
+
+
 # ---------------------------------------------------------------------------
 # SimpleX Adapter
 # ---------------------------------------------------------------------------
@@ -173,6 +219,17 @@ class SimplexAdapter(BasePlatformAdapter):
         except ValueError:
             self._replay_page_size = _REPLAY_DEFAULT_PAGE_SIZE
         self._replay_state = None  # set in connect()
+
+        # Bind-mount mapping for containerised daemons. When set, file
+        # paths the daemon emits (rooted at daemon_files_folder) are
+        # translated to the host-visible directory at host_files_dir.
+        self._host_files_dir: Optional[str] = (
+            os.getenv("SIMPLEX_FILE_DIR", "").strip() or None
+        )
+        self._daemon_files_folder: str = (
+            os.getenv("SIMPLEX_DAEMON_FILES_FOLDER", "").strip()
+            or "/root/.simplex/files"
+        )
 
         logger.info("SimpleX adapter initialized: url=%s", self.ws_url)
 
@@ -459,9 +516,20 @@ class SimplexAdapter(BasePlatformAdapter):
         if file_info and file_info.get("fileStatus") not in {"cancelled", "error"}:
             file_id = file_info.get("fileId")
             file_name = file_info.get("fileName", "file")
+            # The daemon may already have the file on disk under
+            # fileSource.filePath (container-side path). Pass it through
+            # so _fetch_file can translate it via the bind-mount mapping.
+            file_source = file_info.get("fileSource") or {}
+            daemon_path = (
+                file_source.get("filePath")
+                or file_info.get("filePath")
+                or ""
+            )
             if file_id:
                 try:
-                    cached = await self._fetch_file(file_id, file_name)
+                    cached = await self._fetch_file(
+                        file_id, file_name, daemon_path=daemon_path
+                    )
                     if cached:
                         ext = cached.rsplit(".", 1)[-1]
                         if _is_image_ext("." + ext):
@@ -531,8 +599,22 @@ class SimplexAdapter(BasePlatformAdapter):
 
         await self.handle_message(event_obj)
 
-    async def _fetch_file(self, file_id: Any, file_name: str) -> Optional[str]:
-        """Ask the daemon to receive and return a file attachment."""
+    async def _fetch_file(
+        self,
+        file_id: Any,
+        file_name: str,
+        *,
+        daemon_path: str = "",
+    ) -> Optional[str]:
+        """Ask the daemon to receive and return a file attachment.
+
+        ``daemon_path`` is the path the daemon reports for the file in its
+        chat event, e.g. ``/root/.simplex/files/IMG_001.jpg`` when the
+        daemon runs in a container. When SIMPLEX_FILE_DIR is set we
+        translate the container prefix to the host bind-mount and read
+        the file directly; otherwise we fall back to the legacy
+        search-known-dirs flow.
+        """
         # simplex-chat exposes `/api/v1/files/{fileId}` on an HTTP port
         # when started with --http-port. However, the canonical WebSocket API
         # does not have a direct binary download command; files are stored on
@@ -549,8 +631,30 @@ class SimplexAdapter(BasePlatformAdapter):
         # for simplicity we just wait briefly and rely on the daemon's default path.
         await asyncio.sleep(2)
 
-        # simplex-chat stores received files in ~/Downloads or a configured path.
-        # We try common locations.
+        # Fast path: when the daemon told us the file path and we know the
+        # bind-mount layout, read directly from the host-side directory.
+        if self._host_files_dir:
+            host_candidate = _translate_daemon_path(
+                daemon_path,
+                host_root=self._host_files_dir,
+                daemon_root=self._daemon_files_folder,
+            )
+            # Fallback within bind-mount: if path translation failed but a
+            # filename came through, try <host_dir>/<file_name>.
+            if host_candidate is None and file_name:
+                host_candidate = Path(self._host_files_dir).expanduser() / file_name
+            if host_candidate is not None and host_candidate.exists():
+                try:
+                    data = host_candidate.read_bytes()
+                except OSError as e:
+                    logger.warning(
+                        "SimpleX: cannot read bind-mounted file %s: %s",
+                        host_candidate, e,
+                    )
+                else:
+                    return _cache_by_ext(data, file_name)
+
+        # Legacy search — for non-containerised daemons.
         for search_dir in (
             os.path.expanduser("~/Downloads"),
             os.path.expanduser("~/.simplex/files"),
@@ -560,13 +664,7 @@ class SimplexAdapter(BasePlatformAdapter):
             if os.path.exists(candidate):
                 with open(candidate, "rb") as f:
                     data = f.read()
-                ext = _guess_extension(data)
-                if _is_image_ext(ext):
-                    return cache_image_from_bytes(data, ext)
-                elif _is_audio_ext(ext):
-                    return cache_audio_from_bytes(data, ext)
-                else:
-                    return cache_document_from_bytes(data, file_name)
+                return _cache_by_ext(data, file_name)
         return None
 
     # ------------------------------------------------------------------
