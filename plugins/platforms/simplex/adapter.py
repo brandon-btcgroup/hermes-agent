@@ -775,9 +775,12 @@ class SimplexAdapter(BasePlatformAdapter):
 
         logger.warning(
             "SimpleX TRACE PRE-DISPATCH: chat_id=%r text=%r media_count=%d "
-            "is_group=%r replay_state=%r",
+            "is_group=%r replay_state=%r message_handler_set=%r "
+            "session_store_set=%r",
             chat_id, text[:100] if text else "", len(media_urls),
             is_group, self._replay_state is not None,
+            getattr(self, "_message_handler", None) is not None,
+            getattr(self, "_session_store", None) is not None,
         )
 
         # Replay dedupe: groups only (item ids aren't unique across chats,
