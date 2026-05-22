@@ -754,6 +754,13 @@ class SimplexAdapter(BasePlatformAdapter):
             raw_message=wrapper,
         )
 
+        logger.warning(
+            "SimpleX TRACE PRE-DISPATCH: chat_id=%r text=%r media_count=%d "
+            "is_group=%r replay_state=%r",
+            chat_id, text[:100] if text else "", len(media_urls),
+            is_group, self._replay_state is not None,
+        )
+
         # Replay dedupe: groups only (item ids aren't unique across chats,
         # and DM replay isn't implemented yet). Skip if we've already seen
         # this (group_id, item_id) tuple in the dedupe ring, otherwise mark
@@ -767,15 +774,25 @@ class SimplexAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 gid_int = None
                 item_id_int = None
+            logger.warning(
+                "SimpleX TRACE DEDUPE: gid=%r item_id=%r already_dispatched=%r",
+                gid_int, item_id_int,
+                self._replay_state.already_dispatched(gid_int, item_id_int)
+                if gid_int is not None and item_id_int is not None else None,
+            )
             if gid_int is not None and item_id_int is not None:
                 if self._replay_state.already_dispatched(gid_int, item_id_int):
                     return
                 self._replay_state.mark_dispatched(gid_int, item_id_int)
+                logger.warning("SimpleX TRACE DISPATCH (dedupe path): calling handle_message")
                 await self.handle_message(event_obj)
+                logger.warning("SimpleX TRACE DISPATCH (dedupe path): handle_message returned")
                 self._replay_state.update_cursor(gid_int, item_id_int)
                 return
 
+        logger.warning("SimpleX TRACE DISPATCH (fallthrough): calling handle_message")
         await self.handle_message(event_obj)
+        logger.warning("SimpleX TRACE DISPATCH (fallthrough): handle_message returned")
 
     async def _fetch_file(
         self,
