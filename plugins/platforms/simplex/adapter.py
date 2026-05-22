@@ -623,6 +623,16 @@ class SimplexAdapter(BasePlatformAdapter):
         # normalise both layouts.
         chat_info = wrapper.get("chatInfo") or wrapper.get("chat") or {}
         chat_item = wrapper.get("chatItem") or wrapper.get("item") or {}
+        logger.warning(
+            "SimpleX TRACE NCI: wrapper_keys=%s chat_info_type=%r chat_info_keys=%s "
+            "chat_item_keys=%s msg_content_type=%r direction=%r",
+            sorted(wrapper.keys()),
+            chat_info.get("type"),
+            sorted(chat_info.keys()),
+            sorted(chat_item.keys()),
+            (chat_item.get("content") or {}).get("msgContent", {}).get("type"),
+            ((chat_item.get("meta") or {}).get("itemStatus") or {}).get("type"),
+        )
 
         # Only process messages (not calls, deleted items, etc.)
         item_content = chat_item.get("content") or {}
