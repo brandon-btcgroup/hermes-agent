@@ -744,3 +744,23 @@ def register(ctx) -> None:
             "hard message length limit, but keep responses conversational."
         ),
     )
+
+    # CLI surface: `hermes simplex list|join`. Lazy import so missing
+    # optional deps (websockets) don't block platform registration.
+    try:
+        from .cli import register_cli, simplex_command
+    except ImportError as e:
+        logger.debug("simplex: CLI commands unavailable (%r)", e)
+        return
+    ctx.register_cli_command(
+        name="simplex",
+        help="Discover SimpleX contacts/groups and join via invitation link",
+        setup_fn=register_cli,
+        handler_fn=simplex_command,
+        description=(
+            "Operator helpers for SimpleX Chat: list the contacts and "
+            "groups the daemon is connected to, or join a group via an "
+            "invitation link. Useful for discovering the numeric IDs "
+            "needed by SIMPLEX_HOME_CHANNEL and SIMPLEX_ALLOWED_USERS."
+        ),
+    )
