@@ -591,6 +591,15 @@ class SimplexAdapter(BasePlatformAdapter):
 
     async def _handle_event(self, event: dict) -> None:
         """Dispatch a daemon event to the appropriate handler."""
+        # DEBUG: trace every event arriving on the WS so we can see what
+        # the daemon actually emits vs. what the dispatch is looking for.
+        logger.warning(
+            "SimpleX TRACE: event_keys=%s top_type=%r resp_type=%r corrId=%r",
+            sorted(event.keys()),
+            event.get("type"),
+            (event.get("resp") or {}).get("type") if isinstance(event.get("resp"), dict) else None,
+            event.get("corrId"),
+        )
         resp_type = event.get("type") or event.get("resp", {}).get("type", "")
 
         # Responses to our own commands carry a hermes- corrId. Resolve any
