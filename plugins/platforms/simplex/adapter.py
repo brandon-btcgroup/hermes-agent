@@ -591,16 +591,11 @@ class SimplexAdapter(BasePlatformAdapter):
 
     async def _handle_event(self, event: dict) -> None:
         """Dispatch a daemon event to the appropriate handler."""
-        # DEBUG: trace every event arriving on the WS so we can see what
-        # the daemon actually emits vs. what the dispatch is looking for.
-        logger.warning(
-            "SimpleX TRACE: event_keys=%s top_type=%r resp_type=%r corrId=%r",
-            sorted(event.keys()),
-            event.get("type"),
-            (event.get("resp") or {}).get("type") if isinstance(event.get("resp"), dict) else None,
-            event.get("corrId"),
-        )
-        resp_type = event.get("type") or event.get("resp", {}).get("type", "")
+        # The daemon wraps events in {"resp": {"type": ..., ...}}; the
+        # top-level "type" / "chatItems" fields are empty. Unwrap once so
+        # the rest of the dispatch can read either layout uniformly.
+        inner = event.get("resp") if isinstance(event.get("resp"), dict) else event
+        resp_type = inner.get("type") or event.get("type") or ""
 
         # Responses to our own commands carry a hermes- corrId. Resolve any
         # pending Future for /_send_and_wait callers; otherwise drop as echo.
@@ -613,10 +608,11 @@ class SimplexAdapter(BasePlatformAdapter):
             return
 
         if resp_type == "newChatItem":
-            await self._handle_new_chat_item(event)
+            await self._handle_new_chat_item(inner)
         elif resp_type == "newChatItems":
-            # Batch variant — process each item
-            items = event.get("chatItems") or []
+            # Batch variant — process each item. Items may sit at either
+            # the top of the event or inside the resp wrapper.
+            items = inner.get("chatItems") or event.get("chatItems") or []
             for item_wrapper in items:
                 await self._handle_new_chat_item(item_wrapper)
         # Ignore all other event types (delivery receipts, contact updates, etc.)
