@@ -28,6 +28,47 @@ simplex-chat -p 5225
 
 The daemon listens on WebSocket at `ws://127.0.0.1:5225` by default.
 
+## Run via Docker Compose
+
+For a long-running bot it's usually cleaner to manage the daemon under
+Docker Compose so it restarts with the host and stores its profile on
+a named volume. The recipe below also covers attachment delivery —
+without the `--create-bot-allow-files` flag at first launch, peers
+silently refuse to send files to the bot.
+
+```yaml title="docker-compose.yml"
+services:
+  simplex-chat:
+    image: simplexchat/simplex-chat:latest
+    command:
+      - -p
+      - "5225"
+      - --create-bot-allow-files          # bot profile accepts file sends
+      - --auto-accept-files               # auto-accept incoming attachments
+      - "52428800"                        # …up to 50 MiB (boolean is short for `true 1048576`)
+    ports:
+      - "127.0.0.1:5225:5225"             # bind to loopback only — WS is unauthenticated
+    volumes:
+      - simplex-chat-data:/root/.simplex                            # daemon profile state
+      - ${HOME}/.hermes/cache/simplex-files:/root/.simplex/files    # host-readable attachments
+    restart: unless-stopped
+
+volumes:
+  simplex-chat-data:
+```
+
+Bring it up with `docker compose up -d`.
+
+Why each piece matters:
+
+- **`--create-bot-allow-files`** sets the bot profile's `files: yes` preference at creation. Without it, peer SimpleX clients refuse to send attachments to the bot. If your bot is already running without this flag, the recovery is a runtime `/set files yes` via the WS.
+- **`--auto-accept-files 52428800`** auto-accepts files up to 50 MiB. The integer form is a size cap; pass plain `true` for unlimited.
+- **Loopback-only port binding** keeps the unauthenticated WebSocket off the network. If you need remote access put it behind a TLS+auth reverse proxy (nginx / Caddy / Traefik).
+- **`simplex-chat-data` volume** persists the daemon's profile, contacts, and message keys across container restarts.
+- **`${HOME}/.hermes/cache/simplex-files` bind-mount** lets Hermes read inbound attachments directly off the host filesystem. Hermes runs outside the container, so without this bind-mount it has no way to access files the daemon receives. The host directory is configurable via `SIMPLEX_FILE_DIR` (see [Environment variables](#configure-hermes)); the container side should match the daemon's `files` folder, which is `/root/.simplex/files` by default and overridable via `SIMPLEX_DAEMON_FILES_FOLDER`.
+
+The daemon listens on WebSocket at `ws://127.0.0.1:5225` once it's up. Verify with `docker compose logs -f simplex-chat`; the first run will print the bot's connection link, which peer clients use to add the bot as a contact.
+
 ## Configure Hermes
 
 ### Via setup wizard
