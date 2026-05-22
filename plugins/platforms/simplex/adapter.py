@@ -671,18 +671,37 @@ class SimplexAdapter(BasePlatformAdapter):
             logger.debug("SimpleX: ignoring event with no chat_id")
             return
 
-        # Sender — for groups the message includes a chatItemMember sub-object
-        member = chat_item.get("chatItemMember") or {}
+        # Sender — group member info lives in different places by daemon
+        # version: newer daemons emit chatItem.chatDir.groupMember; older
+        # ones used chatItem.chatItemMember. Check both.
+        chat_dir = chat_item.get("chatDir") or {}
+        member = (
+            chat_dir.get("groupMember")
+            or chat_item.get("chatItemMember")
+            or {}
+        )
         if is_group and member:
-            sender_id = str(member.get("memberId") or member.get("id") or chat_id)
+            member_profile = member.get("memberProfile") or {}
+            sender_id = str(
+                member.get("memberId")
+                or member.get("groupMemberId")
+                or member.get("id")
+                or chat_id
+            )
             sender_name = (
                 member.get("displayName")
                 or member.get("localDisplayName")
+                or member_profile.get("displayName")
                 or sender_id
             )
         else:
             sender_id = chat_id
             sender_name = chat_name
+        logger.warning(
+            "SimpleX TRACE SENDER: sender_id=%r sender_name=%r chat_dir_type=%r "
+            "member_keys=%s",
+            sender_id, sender_name, chat_dir.get("type"), sorted(member.keys()),
+        )
 
         # Extract text
         text = msg_content.get("text") or ""
