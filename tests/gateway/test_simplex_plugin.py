@@ -214,7 +214,7 @@ async def test_send_dm():
     result = await adapter.send("contact-42", "Hello, SimpleX!")
     mock_ws.send.assert_called_once()
     payload = json.loads(mock_ws.send.call_args[0][0])
-    assert payload["cmd"] == "@[contact-42] Hello, SimpleX!"
+    assert payload["cmd"] == "/_send @contact-42 text Hello, SimpleX!"
     assert payload["corrId"].startswith(_CORR_PREFIX)
     assert result.success is True
 
@@ -230,7 +230,7 @@ async def test_send_group():
 
     result = await adapter.send("group:grp-99", "Hello, group!")
     payload = json.loads(mock_ws.send.call_args[0][0])
-    assert payload["cmd"] == "#[grp-99] Hello, group!"
+    assert payload["cmd"] == "/_send #grp-99 text Hello, group!"
     assert result.success is True
 
 
@@ -261,6 +261,57 @@ async def test_handle_event_filters_own_corr_id():
     await adapter._handle_event({"corrId": own, "type": "newChatItem"})
     handler_mock.assert_not_called()
     assert own not in adapter._pending_corr_ids  # discarded
+
+
+@pytest.mark.asyncio
+async def test_handle_event_unwraps_resp_chatitems():
+    """Bug 2: newChatItems nests `chatItems` under `resp`, not at top level."""
+    from gateway.config import PlatformConfig
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+    handler_mock = AsyncMock()
+    adapter._handle_new_chat_item = handler_mock  # type: ignore
+
+    event = {
+        "resp": {
+            "type": "newChatItems",
+            "chatItems": [{"id": 1}, {"id": 2}],
+        }
+    }
+    await adapter._handle_event(event)
+    assert handler_mock.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_group_sender_from_chatdir_groupmember():
+    """Bug: current simplex-chat reports the group sender under
+    chatItem.chatDir.groupMember, not the legacy chatItemMember key."""
+    from gateway.config import PlatformConfig
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+    captured = AsyncMock()
+    adapter.handle_message = captured  # type: ignore
+
+    wrapper = {
+        "chatInfo": {"type": "group", "groupInfo": {"groupId": 7, "displayName": "hermes-agent"}},
+        "chatItem": {
+            "content": {"msgContent": {"type": "text", "text": "hello"}},
+            "meta": {"itemStatus": {"type": "rcvNew"}},
+            "chatDir": {
+                "type": "groupRcv",
+                "groupMember": {
+                    "memberId": "memb-abc",
+                    "memberProfile": {"displayName": "Brandon"},
+                },
+            },
+        },
+    }
+    await adapter._handle_new_chat_item(wrapper)
+
+    captured.assert_awaited_once()
+    event_obj = captured.await_args[0][0]
+    assert event_obj.source.user_id == "memb-abc"
+    assert event_obj.source.user_name == "Brandon"
 
 
 # ---------------------------------------------------------------------------

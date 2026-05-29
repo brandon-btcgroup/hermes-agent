@@ -230,6 +230,14 @@ class SimplexAdapter(BasePlatformAdapter):
                     backoff = WS_RETRY_DELAY_INITIAL
                     self._last_ws_activity = time.time()
                     logger.info("SimpleX WS: connected")
+                    # simplex-chat only pushes async events (newChatItems,
+                    # chatItemUpdated, ...) to connections that have issued
+                    # /_start. Without this the daemon stores inbound messages
+                    # but never notifies us. corrId uses _CORR_PREFIX so the
+                    # chatRunning reply is filtered as an echo by _handle_event.
+                    await ws.send(
+                        json.dumps({"corrId": f"{_CORR_PREFIX}init", "cmd": "/_start"})
+                    )
 
                     async for raw in ws:
                         if not self._running:
@@ -304,8 +312,9 @@ class SimplexAdapter(BasePlatformAdapter):
         if resp_type == "newChatItem":
             await self._handle_new_chat_item(event)
         elif resp_type == "newChatItems":
-            # Batch variant — process each item
-            items = event.get("chatItems") or []
+            # Batch variant — process each item. The daemon nests chatItems
+            # inside the resp wrapper, not at the top level.
+            items = event.get("chatItems") or event.get("resp", {}).get("chatItems") or []
             for item_wrapper in items:
                 await self._handle_new_chat_item(item_wrapper)
         # Ignore all other event types (delivery receipts, contact updates, etc.)
@@ -354,13 +363,22 @@ class SimplexAdapter(BasePlatformAdapter):
             logger.debug("SimpleX: ignoring event with no chat_id")
             return
 
-        # Sender — for groups the message includes a chatItemMember sub-object
-        member = chat_item.get("chatItemMember") or {}
+        # Sender — current simplex-chat reports the group member under
+        # chatItem.chatDir.groupMember; older payloads used chatItemMember.
+        chat_dir = chat_item.get("chatDir") or {}
+        member = chat_dir.get("groupMember") or chat_item.get("chatItemMember") or {}
         if is_group and member:
-            sender_id = str(member.get("memberId") or member.get("id") or chat_id)
+            member_profile = member.get("memberProfile") or {}
+            sender_id = str(
+                member.get("memberId")
+                or member.get("groupMemberId")
+                or member.get("id")
+                or chat_id
+            )
             sender_name = (
                 member.get("displayName")
                 or member.get("localDisplayName")
+                or member_profile.get("displayName")
                 or sender_id
             )
         else:
@@ -506,9 +524,9 @@ class SimplexAdapter(BasePlatformAdapter):
 
         if chat_id.startswith("group:"):
             group_id = chat_id[6:]
-            cmd_str = f"#[{group_id}] {content}"
+            cmd_str = f"/_send #{group_id} text {content}"
         else:
-            cmd_str = f"@[{chat_id}] {content}"
+            cmd_str = f"/_send @{chat_id} text {content}"
 
         payload = {
             "corrId": corr_id,
@@ -641,9 +659,9 @@ async def _standalone_send(
     try:
         if chat_id.startswith("group:"):
             group_id = chat_id[6:]
-            cmd_str = f"#[{group_id}] {message}"
+            cmd_str = f"/_send #{group_id} text {message}"
         else:
-            cmd_str = f"@[{chat_id}] {message}"
+            cmd_str = f"/_send @{chat_id} text {message}"
 
         payload = {
             "corrId": f"hermes-snd-{int(time.time() * 1000)}",
