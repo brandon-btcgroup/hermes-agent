@@ -1,10 +1,63 @@
 ---
 title: SimpleX migration — handoff notes
 date: 2026-05-21
-status: paused, server reverted to feat/simplex-plugin
+updated: 2026-05-29
+status: fixes consolidated on fix/simplex-event-dispatch (pushed to fork); awaiting live retest of issue #3
 ---
 
 # SimpleX migration — handoff
+
+## Update — 2026-05-29 (read this first)
+
+A community bug report, **NousResearch/hermes-agent issue #30150**
+(reporter `flyingeagles123`), independently surfaced three upstream-adapter
+bugs. It is marked a **duplicate of open PR #26433** (`fix/gateway-simplex-bugs`,
+author `daimon-nous`, **OPEN, not merged**). Cross-referencing it against
+our own TRACE findings reshaped the plan:
+
+**New consolidated branch: `fix/simplex-event-dispatch`** (off `main` =
+upstream `4cc18877c`, built + tested + **pushed to `brandon-btcgroup/hermes-agent`**;
+on the AI server the fork remote is `fork`). It carries **four** fixes in
+`plugins/platforms/simplex/adapter.py`:
+
+| Fix | What | Overlap |
+|---|---|---|
+| 1. `/_start` on WS connect | daemon only pushes async events to connections that issued `/_start`; without it inbound messages are stored but never delivered (this is the source of the `WS idle, forcing reconnect` warnings) | **new — not in our original notes**; = issue #30150 bug 1 / PR #26433 |
+| 2. `newChatItems` resp-nesting | read `event["resp"]["chatItems"]` (batch items nest under `resp`, not top level) | = our old "upstream bug #1" / issue bug 2 / PR #26433 |
+| 3. sender from `chatDir.groupMember` | with `chatItemMember` fallback for old payloads | = our old "upstream bug #2"; **NOT in PR #26433**; matches large feature PRs #4666 / #27978 |
+| 4. outbound `/_send @id text` / `/_send #id text` | replaces invalid `@[id]`/`#[id]` bracket syntax in `send()` + `_standalone_send()` | = issue bug 3 / PR #26433 |
+
+Tests: `scripts/run_tests.sh tests/gateway/test_simplex_plugin.py` →
+**29 passed, 0 failed** (added 2 regression tests: resp-unwrap dispatch,
+chatDir.groupMember sender). `check-windows-footguns.py --diff main` clean.
+Commit `4f1641e29`.
+
+**Decisions this implies:**
+
+- **Do NOT open our own PR-6 for the resp-unwrap fix** — PR #26433
+  already covers bugs 1/2/4. Comment on / +1 #26433 instead.
+- **Fix 3 (sender extraction) is our one novel upstream contribution.**
+  It is absent from #26433 but present in the large feature PRs #4666
+  and #27978. If #26433 merges first, rebase this branch down to just
+  fix 3 and offer it as a focused follow-up.
+- **`/_start` (fix 1) was never in our original diagnosis.** In our prior
+  TRACE runs events *were* arriving, so something else (old fork still
+  subscribed? shared daemon?) masked it. This is the most likely reason
+  inbound behaviour was inconsistent — **re-verify carefully.**
+
+**Issue #3 (silent drop in `_process_message_background`) is still
+unresolved and is NOT addressed by any of the four fixes above** — it
+sits downstream of everything they touch. The next live retest on the AI
+server (checkout `fix/simplex-event-dispatch`) is specifically to see
+whether, now that `/_start` and correct dispatch are in place, a phone
+message produces an actual end-to-end reply — or whether issue #3 still
+swallows it. Follow the issue-#3 debugging plan below if it stays silent.
+
+Related upstream threads: issue #30150, PR #26433 (open), #26480, #27120,
+#4666, #27978.
+
+---
+
 
 Picking up: we paused mid-migration from Brandon's old standalone fork
 (`feat/simplex-plugin`) onto upstream's bundled `simplex-platform`
@@ -228,6 +281,12 @@ daemon, we don't have a live integration test for the assumptions
 each PR makes.
 
 Suggested ordering when we resume:
+
+> **Superseded by the 2026-05-29 update above.** Step 1 below assumed no
+> upstream PR existed; PR #26433 now covers the resp-unwrap + `/_start` +
+> `/_send` fixes, and our consolidated `fix/simplex-event-dispatch` branch
+> carries all four (incl. sender extraction). Treat steps 2–4 as still
+> valid once issue #3 is root-caused.
 
 1. **First** — open PR-6 (resp unwrap + sender extraction) against
    NousResearch as a standalone upstream bug fix. This is the
