@@ -522,11 +522,16 @@ class SimplexAdapter(BasePlatformAdapter):
         """Send a text message to a contact or group."""
         corr_id = self._make_corr_id()
 
+        # Use the structured `/_send <ref> json <ComposedMessage[]>` form so
+        # newlines, backslashes and other special characters in the body are
+        # escaped correctly — the `text` shorthand truncates the body at the
+        # first newline, which mangles multi-line agent replies.
+        composed = json.dumps([{"msgContent": {"type": "text", "text": content}}])
         if chat_id.startswith("group:"):
             group_id = chat_id[6:]
-            cmd_str = f"/_send #{group_id} text {content}"
+            cmd_str = f"/_send #{group_id} json {composed}"
         else:
-            cmd_str = f"/_send @{chat_id} text {content}"
+            cmd_str = f"/_send @{chat_id} json {composed}"
 
         payload = {
             "corrId": corr_id,
@@ -657,11 +662,12 @@ async def _standalone_send(
         return {"error": "SimpleX standalone send: SIMPLEX_WS_URL is required"}
 
     try:
+        composed = json.dumps([{"msgContent": {"type": "text", "text": message}}])
         if chat_id.startswith("group:"):
             group_id = chat_id[6:]
-            cmd_str = f"/_send #{group_id} text {message}"
+            cmd_str = f"/_send #{group_id} json {composed}"
         else:
-            cmd_str = f"/_send @{chat_id} text {message}"
+            cmd_str = f"/_send @{chat_id} json {composed}"
 
         payload = {
             "corrId": f"hermes-snd-{int(time.time() * 1000)}",

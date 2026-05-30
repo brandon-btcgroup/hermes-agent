@@ -214,7 +214,10 @@ async def test_send_dm():
     result = await adapter.send("contact-42", "Hello, SimpleX!")
     mock_ws.send.assert_called_once()
     payload = json.loads(mock_ws.send.call_args[0][0])
-    assert payload["cmd"] == "/_send @contact-42 text Hello, SimpleX!"
+    expected = "/_send @contact-42 json " + json.dumps(
+        [{"msgContent": {"type": "text", "text": "Hello, SimpleX!"}}]
+    )
+    assert payload["cmd"] == expected
     assert payload["corrId"].startswith(_CORR_PREFIX)
     assert result.success is True
 
@@ -230,8 +233,28 @@ async def test_send_group():
 
     result = await adapter.send("group:grp-99", "Hello, group!")
     payload = json.loads(mock_ws.send.call_args[0][0])
-    assert payload["cmd"] == "/_send #grp-99 text Hello, group!"
+    expected = "/_send #grp-99 json " + json.dumps(
+        [{"msgContent": {"type": "text", "text": "Hello, group!"}}]
+    )
+    assert payload["cmd"] == expected
     assert result.success is True
+
+
+@pytest.mark.asyncio
+async def test_send_escapes_multiline_body():
+    """Multi-line replies must be JSON-escaped in the command, not truncated
+    at the first newline (the reason for the structured /_send … json form)."""
+    from gateway.config import PlatformConfig
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+    mock_ws = AsyncMock()
+    adapter._ws = mock_ws
+
+    await adapter.send("group:1", "line one\nline two")
+    payload = json.loads(mock_ws.send.call_args[0][0])
+    assert payload["cmd"].startswith("/_send #1 json ")
+    assert "\n" not in payload["cmd"]                  # no raw newline leaks in
+    assert "line one\\nline two" in payload["cmd"]     # full body preserved, escaped
 
 
 @pytest.mark.asyncio
