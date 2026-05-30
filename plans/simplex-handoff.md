@@ -2,7 +2,7 @@
 title: SimpleX migration — handoff notes
 date: 2026-05-21
 updated: 2026-05-29
-status: fixes consolidated on fix/simplex-event-dispatch (pushed to fork); awaiting live retest of issue #3
+status: production branch hardened (d31a04341, json send form); sender fix upstreamed as PR #35046; issue #3 (silent drop) still the open live-retest item
 ---
 
 # SimpleX migration — handoff
@@ -55,6 +55,60 @@ swallows it. Follow the issue-#3 debugging plan below if it stays silent.
 
 Related upstream threads: issue #30150, PR #26433 (open), #26480, #27120,
 #4666, #27978.
+
+---
+
+## Update — 2026-05-29 (part 2): upstream PR opened + outbound send hardened
+
+### Sender fix upstreamed as a focused PR
+
+- Filed **issue #35045** and opened **PR #35046**
+  (`brandon-btcgroup:fix/simplex-group-sender` → `NousResearch:main`),
+  containing **only** the `chatDir.groupMember` sender fix + one regression
+  test. PR body discloses the overlap (defers the other three bugs to #26433;
+  notes #4666/#27978 carry the same change in larger form) and offers to
+  fold/close. Also left a +1 comment on #26433 with the sender diff and a
+  note that its `send()` change fixes DM only and leaves group send broken.
+- Branch `fix/simplex-group-sender` is off latest upstream; 28/28 SimpleX
+  tests pass. Full-suite failures on this machine are **pre-existing on
+  unmodified `main`** (anthropic adapter, gateway service/WSL/systemd, TUI —
+  macOS-environment), confirmed by running the same files on `689ef5e23`.
+
+### Why we did NOT open a group-send PR
+
+Group send is **not** an uncovered gap. Three different fixes already exist
+upstream:
+
+| PR | Group-send form |
+|---|---|
+| #4666 | `/_send #<id> json [{"msgContent":{"type":"text","text":…}}]` |
+| #27978 | `/_send #<id> json [...]` (same) |
+| #26480 | `#<quoted_group_name> <body>` (name-based) |
+| #26433 | leaves it broken (`#[<id>]`) — DM only |
+
+The `#4666`/`#27978` **json** form is more robust than a `text` shorthand:
+it escapes newlines/backslashes, whereas `/_send #<id> text <body>` truncates
+the body at the first newline. A competing focused PR would be redundant and
+use an inferior form, so we skipped it.
+
+### Production branch hardened to the json form
+
+`fix/simplex-event-dispatch` commit **`d31a04341`** switches `send()` and
+`_standalone_send()` (group **and** DM) from `/_send <ref> text <body>` to
+`/_send <ref> json [{"msgContent":{"type":"text","text":<body>}}]`. This fixes
+silent truncation of **multi-line agent replies** and aligns outbound text
+with where upstream is heading. SimpleX suite now 30/30 (added
+`test_send_escapes_multiline_body`). Pushed to fork as a fast-forward
+(`8d2154540..d31a04341`) — redeploy is `git reset --hard
+fork/fix/simplex-event-dispatch` + `hermes gateway restart` (no dep reinstall;
+adapter-only change, editable install).
+
+> Rebase note: when #26433 merges, `send()` will conflict — upstream changes
+> the DM line to `@{display_name}` (needs its `_contact_names` polling
+> subsystem), we use `/_send @<id> json`. Keep ours unless maintainers
+> standardize on the display-name form; ours doesn't depend on cached names
+> and handles groups. The `simplex-known-good-20260529` tag predates this
+> json change, so rolling back to it also reverts the multi-line fix.
 
 ---
 
