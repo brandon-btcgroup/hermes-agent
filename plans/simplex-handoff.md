@@ -2,7 +2,7 @@
 title: SimpleX migration — handoff notes
 date: 2026-05-21
 updated: 2026-05-29
-status: production branch hardened (d31a04341, json send form); sender fix upstreamed as PR #35046; issue #3 (silent drop) still the open live-retest item
+status: SimpleX fully working in production (verified live: multi-line round-trip); issue #3 resolved; sender fix upstreamed as PR #35046
 ---
 
 # SimpleX migration — handoff
@@ -109,6 +109,17 @@ adapter-only change, editable install).
 > standardize on the display-name form; ours doesn't depend on cached names
 > and handles groups. The `simplex-known-good-20260529` tag predates this
 > json change, so rolling back to it also reverts the multi-line fix.
+
+### Issue #3 (silent drop) — RESOLVED
+
+The `_process_message_background` silent drop documented below never
+reproduced once the inbound path was fixed. Confirmed **live in production**:
+a phone message to the group ("write a 3-line haiku") returned a complete
+3-line reply on the phone — full round-trip (phone → daemon → adapter →
+model → multi-line reply → phone). So the earlier silence was the inbound
+side (no `/_start` subscription + dropped/ misparsed events), not a hang in
+the background task. The original issue-#3 section below is kept for history
+but is no longer an open item.
 
 ---
 
