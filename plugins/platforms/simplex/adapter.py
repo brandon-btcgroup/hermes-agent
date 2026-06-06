@@ -230,6 +230,14 @@ class SimplexAdapter(BasePlatformAdapter):
                     backoff = WS_RETRY_DELAY_INITIAL
                     self._last_ws_activity = time.time()
                     logger.info("SimpleX WS: connected")
+                    # simplex-chat only pushes async events (newChatItems,
+                    # chatItemUpdated, ...) to connections that have issued
+                    # /_start. Without this the daemon stores inbound messages
+                    # but never notifies us. corrId uses _CORR_PREFIX so the
+                    # chatRunning reply is filtered as an echo by _handle_event.
+                    await ws.send(
+                        json.dumps({"corrId": f"{_CORR_PREFIX}init", "cmd": "/_start"})
+                    )
 
                     async for raw in ws:
                         if not self._running:
@@ -359,13 +367,22 @@ class SimplexAdapter(BasePlatformAdapter):
             logger.debug("SimpleX: ignoring event with no chat_id")
             return
 
-        # Sender — for groups the message includes a chatItemMember sub-object
-        member = chat_item.get("chatItemMember") or {}
+        # Sender — current simplex-chat reports the group member under
+        # chatItem.chatDir.groupMember; older payloads used chatItemMember.
+        chat_dir = chat_item.get("chatDir") or {}
+        member = chat_dir.get("groupMember") or chat_item.get("chatItemMember") or {}
         if is_group and member:
-            sender_id = str(member.get("memberId") or member.get("id") or chat_id)
+            member_profile = member.get("memberProfile") or {}
+            sender_id = str(
+                member.get("memberId")
+                or member.get("groupMemberId")
+                or member.get("id")
+                or chat_id
+            )
             sender_name = (
                 member.get("displayName")
                 or member.get("localDisplayName")
+                or member_profile.get("displayName")
                 or sender_id
             )
         else:
@@ -509,15 +526,16 @@ class SimplexAdapter(BasePlatformAdapter):
         """Send a text message to a contact or group."""
         corr_id = self._make_corr_id()
 
+        # Use the structured `/_send <ref> json <ComposedMessage[]>` form so
+        # newlines, backslashes and other special characters in the body are
+        # escaped correctly — the `text` shorthand truncates the body at the
+        # first newline, which mangles multi-line agent replies.
+        composed = json.dumps([{"msgContent": {"type": "text", "text": content}}])
         if chat_id.startswith("group:"):
             group_id = chat_id[6:]
-            cmd_str = f"#[{group_id}] {content}"
+            cmd_str = f"/_send #{group_id} json {composed}"
         else:
-            # SimpleX CLI addresses direct contacts by display name, e.g.
-            # `@Alice hello`. `@[Alice]` is interpreted literally as a contact
-            # named "[Alice]" and `@[4]` as "[4]", so do not wrap direct
-            # chat IDs / display names in brackets.
-            cmd_str = f"@{chat_id} {content}"
+            cmd_str = f"/_send @{chat_id} json {composed}"
 
         payload = {
             "corrId": corr_id,
@@ -648,12 +666,12 @@ async def _standalone_send(
         return {"error": "SimpleX standalone send: SIMPLEX_WS_URL is required"}
 
     try:
+        composed = json.dumps([{"msgContent": {"type": "text", "text": message}}])
         if chat_id.startswith("group:"):
             group_id = chat_id[6:]
-            cmd_str = f"#[{group_id}] {message}"
+            cmd_str = f"/_send #{group_id} json {composed}"
         else:
-            # Direct contacts are addressed by display name without brackets.
-            cmd_str = f"@{chat_id} {message}"
+            cmd_str = f"/_send @{chat_id} json {composed}"
 
         payload = {
             "corrId": f"hermes-snd-{int(time.time() * 1000)}",
