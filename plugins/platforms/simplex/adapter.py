@@ -1260,3 +1260,15 @@ def register(ctx) -> None:
             "hard message length limit, but keep responses conversational."
         ),
     )
+    try:
+        from .cli import register_cli, simplex_command
+    except ImportError as e:
+        logger.debug("simplex: CLI commands unavailable (%r)", e)
+        return
+    ctx.register_cli_command(
+        name="simplex",
+        help="Discover SimpleX contacts/groups and join via invitation link",
+        setup_fn=register_cli,
+        handler_fn=simplex_command,
+        description="Discover SimpleX contacts/groups and join via invitation link",
+    )
