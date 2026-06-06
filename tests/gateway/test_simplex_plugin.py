@@ -394,6 +394,77 @@ async def test_standalone_send_missing_url(monkeypatch):
     assert "error" in result
 
 
+@pytest.mark.asyncio
+async def test_standalone_send_dm_json_form(monkeypatch):
+    """Happy path: direct-contact standalone send emits /_send @<id> json form."""
+    try:
+        import websockets  # noqa: F401
+    except ImportError:
+        pytest.skip("websockets not installed")
+
+    import asyncio
+    from unittest.mock import patch
+
+    monkeypatch.setenv("SIMPLEX_WS_URL", "ws://localhost:5225")
+
+    # Build an async context-manager mock that captures ws.send calls.
+    mock_ws = AsyncMock()
+    mock_connect = MagicMock()
+    mock_connect.return_value.__aenter__ = AsyncMock(return_value=mock_ws)
+    mock_connect.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    pconfig = MagicMock()
+    pconfig.extra = {"ws_url": "ws://localhost:5225"}
+
+    with patch("websockets.connect", mock_connect):
+        # Also patch asyncio.sleep so the test doesn't actually pause.
+        with patch("asyncio.sleep", AsyncMock()):
+            result = await _standalone_send(pconfig, "contact-42", "Hello, standalone!")
+
+    assert result == {"success": True, "platform": "simplex", "chat_id": "contact-42"}
+    mock_ws.send.assert_called_once()
+    raw = mock_ws.send.call_args[0][0]
+    payload = json.loads(raw)
+    expected_cmd = "/_send @contact-42 json " + json.dumps(
+        [{"msgContent": {"type": "text", "text": "Hello, standalone!"}}]
+    )
+    assert payload["cmd"] == expected_cmd
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_group_json_form(monkeypatch):
+    """Happy path: group standalone send emits /_send #<id> json form."""
+    try:
+        import websockets  # noqa: F401
+    except ImportError:
+        pytest.skip("websockets not installed")
+
+    from unittest.mock import patch
+
+    monkeypatch.setenv("SIMPLEX_WS_URL", "ws://localhost:5225")
+
+    mock_ws = AsyncMock()
+    mock_connect = MagicMock()
+    mock_connect.return_value.__aenter__ = AsyncMock(return_value=mock_ws)
+    mock_connect.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    pconfig = MagicMock()
+    pconfig.extra = {"ws_url": "ws://localhost:5225"}
+
+    with patch("websockets.connect", mock_connect):
+        with patch("asyncio.sleep", AsyncMock()):
+            result = await _standalone_send(pconfig, "group:grp-77", "line one\nline two")
+
+    assert result == {"success": True, "platform": "simplex", "chat_id": "group:grp-77"}
+    raw = mock_ws.send.call_args[0][0]
+    payload = json.loads(raw)
+    # Must use /_send #<group_id> json form.
+    assert payload["cmd"].startswith("/_send #grp-77 json ")
+    # Newlines must be JSON-escaped — no raw newlines in the command string.
+    assert "\n" not in payload["cmd"]
+    assert "line one\\nline two" in payload["cmd"]
+
+
 # ---------------------------------------------------------------------------
 # 10. register() — plugin-side metadata
 # ---------------------------------------------------------------------------
