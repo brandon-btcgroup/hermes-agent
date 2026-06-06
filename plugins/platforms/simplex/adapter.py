@@ -679,6 +679,10 @@ async def _standalone_send(
         }
 
         async with _wsclient.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
+            # Intentionally no /_start here: the daemon's chat controller is
+            # already running (started by the persistent listener connection),
+            # and /_start only gates async event *delivery*, not outbound
+            # sends. An ephemeral send-only connection needs nothing extra.
             await ws.send(json.dumps(payload))
             # Give the daemon a moment to process the command before closing.
             await asyncio.sleep(0.5)
