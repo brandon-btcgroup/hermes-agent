@@ -121,6 +121,26 @@ def test_translate_expands_user_in_host_root(monkeypatch, tmp_path):
     assert result == tmp_path / "files" / "x.jpg"
 
 
+def test_translate_blocks_path_traversal(tmp_path):
+    """A crafted daemon path containing '..' must not escape host_root."""
+    result = _translate_daemon_path(
+        "/root/.simplex/files/../../etc/passwd",
+        host_root="/host/files",
+        daemon_root="/root/.simplex/files",
+    )
+    assert result is None
+
+
+def test_translate_blocks_path_traversal_with_trailing_slash(tmp_path):
+    """Trailing slash on a traversal path must also be blocked."""
+    result = _translate_daemon_path(
+        "/root/.simplex/files/../../etc/passwd/",
+        host_root="/host/files",
+        daemon_root="/root/.simplex/files",
+    )
+    assert result is None
+
+
 # ---------------------------------------------------------------------------
 # 2. Adapter env-var parsing
 # ---------------------------------------------------------------------------

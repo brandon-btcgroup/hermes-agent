@@ -117,18 +117,27 @@ def _translate_daemon_path(
 ) -> Optional[Path]:
     """Map a daemon-reported file path to the corresponding host path.
 
-    Returns None if translation isn't possible (either env var unset, or
-    the daemon path doesn't sit under daemon_root). The caller falls
-    back to the legacy search-known-dirs flow.
+    Returns None if translation isn't possible (env var unset, the daemon
+    path doesn't sit under daemon_root, or the result would escape
+    host_root via a crafted '..' suffix). The caller falls back to the
+    legacy search-known-dirs flow.
     """
     if not daemon_path or not host_root or not daemon_root:
         return None
-    # Normalise trailing separators so the prefix compare is exact.
     d_root = daemon_root.rstrip("/\\")
+    daemon_path = daemon_path.rstrip("/\\")
     if not (daemon_path == d_root or daemon_path.startswith(d_root + "/")):
         return None
     suffix = daemon_path[len(d_root):].lstrip("/")
-    host = Path(host_root).expanduser() / suffix if suffix else Path(host_root).expanduser()
+    base = Path(host_root).expanduser()
+    host = base / suffix if suffix else base
+    # Defense-in-depth: a crafted daemon path (e.g. "<root>/../../etc/passwd")
+    # must not escape host_root. The daemon path is peer-influenced JSON.
+    try:
+        if not host.resolve().is_relative_to(base.resolve()):
+            return None
+    except (OSError, ValueError):
+        return None
     return host
 
 
@@ -534,7 +543,7 @@ class SimplexAdapter(BasePlatformAdapter):
         await self._send_ws(cmd)
         # The daemon will emit a chatItemUpdated event when the file lands;
         # for simplicity we just wait briefly and rely on the daemon's default path.
-        await asyncio.sleep(2)
+        await asyncio.sleep(2)  # Wait for daemon to finish writing before any lookup.
 
         # Fast path: when the daemon told us the file path and we know the
         # bind-mount layout, read directly from the host-side directory.
