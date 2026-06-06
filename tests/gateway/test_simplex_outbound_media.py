@@ -237,6 +237,130 @@ def test_stage_returns_none_when_download_fails(monkeypatch, tmp_path):
     assert staged is None
 
 
+class _FakeResponse:
+    """Minimal urlopen() response stand-in supporting the context-manager
+    protocol, .headers.get(), and chunked .read()."""
+
+    def __init__(self, body: bytes, content_length=None):
+        self._body = body
+        self._pos = 0
+        cl = (
+            str(content_length)
+            if content_length is not None
+            else str(len(body))
+        )
+        self.headers = {"Content-Length": cl}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            chunk = self._body[self._pos:]
+            self._pos = len(self._body)
+            return chunk
+        chunk = self._body[self._pos:self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+
+class _DictHeaders(dict):
+    pass
+
+
+def _make_response(body, content_length):
+    resp = _FakeResponse(body, content_length=content_length)
+    resp.headers = _DictHeaders(resp.headers)
+    return resp
+
+
+def test_fetch_remote_aborts_when_streamed_body_exceeds_cap(monkeypatch, tmp_path):
+    cap = 1024
+    body = b"x" * (cap + 500)
+    # Advertise a small/honest length so the pre-check passes; the abort must
+    # trigger from the running byte count while streaming.
+    resp = _make_response(body, content_length=0)
+
+    def fake_urlopen(url, timeout=None):
+        return resp
+
+    monkeypatch.setattr(_simplex.urllib.request, "urlopen", fake_urlopen)
+    target = tmp_path / "big.bin"
+    with pytest.raises(ValueError, match="exceeds"):
+        _simplex._fetch_remote_to(target, "https://example.com/big.bin", max_bytes=cap)
+    # No partial file left behind.
+    assert not target.exists()
+
+
+def test_fetch_remote_aborts_when_content_length_over_cap(monkeypatch, tmp_path):
+    cap = 1024
+    resp = _make_response(b"tiny", content_length=cap + 1)
+
+    def fake_urlopen(url, timeout=None):
+        return resp
+
+    monkeypatch.setattr(_simplex.urllib.request, "urlopen", fake_urlopen)
+    target = tmp_path / "advertised.bin"
+    with pytest.raises(ValueError, match="exceeds"):
+        _simplex._fetch_remote_to(
+            target, "https://example.com/advertised.bin", max_bytes=cap
+        )
+    assert not target.exists()
+
+
+def test_fetch_remote_succeeds_under_cap(monkeypatch, tmp_path):
+    body = b"small payload"
+    resp = _make_response(body, content_length=len(body))
+
+    def fake_urlopen(url, timeout=None):
+        return resp
+
+    monkeypatch.setattr(_simplex.urllib.request, "urlopen", fake_urlopen)
+    target = tmp_path / "ok.bin"
+    _simplex._fetch_remote_to(target, "https://example.com/ok.bin", max_bytes=1024)
+    assert target.read_bytes() == body
+
+
+def test_stage_rejects_non_http_scheme_without_fetch(monkeypatch, tmp_path):
+    bind = tmp_path / "bind"
+    bind.mkdir()
+
+    called = {"hit": False}
+
+    def fail_urlopen(*_a, **_kw):
+        called["hit"] = True
+        raise AssertionError("urlopen must not be reached for non-http(s) scheme")
+
+    monkeypatch.setattr(_simplex.urllib.request, "urlopen", fail_urlopen)
+    adapter = _adapter(monkeypatch, SIMPLEX_FILE_DIR=str(bind))
+    staged = asyncio.run(adapter._stage_for_send("ftp://example.com/x.png"))
+    assert staged is None
+    assert called["hit"] is False
+
+
+def test_send_image_non_http_scheme_falls_back_to_text(monkeypatch, tmp_path):
+    bind = tmp_path / "bind"
+    bind.mkdir()
+
+    called = {"hit": False}
+
+    def fail_urlopen(*_a, **_kw):
+        called["hit"] = True
+        raise AssertionError("urlopen must not be reached for non-http(s) scheme")
+
+    monkeypatch.setattr(_simplex.urllib.request, "urlopen", fail_urlopen)
+    adapter = _adapter(monkeypatch, SIMPLEX_FILE_DIR=str(bind))
+    asyncio.run(adapter.send_image("group:42", "ftp://example.com/img.png"))
+    # No urlopen attempted; the dispatched command is a plain text send.
+    assert called["hit"] is False
+    payload = _sent_payload(adapter)
+    assert "ftp://example.com/img.png" in payload["cmd"]
+    assert "fileSource" not in payload["cmd"]
+
+
 # ---------------------------------------------------------------------------
 # 4. _container_path_for
 # ---------------------------------------------------------------------------

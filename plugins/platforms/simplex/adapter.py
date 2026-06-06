@@ -96,6 +96,7 @@ _CORR_PREFIX = "hermes-"
 # Outbound media defaults — see _make_image_thumbnail, _probe_duration_*
 _THUMBNAIL_MAX_PX = 224
 _OUTBOUND_FETCH_TIMEOUT_S = 30.0
+_OUTBOUND_MAX_FETCH_BYTES = 52_428_800  # 50 MiB — matches the daemon's default auto-accept cap
 _FFPROBE_TIMEOUT_S = 10.0
 _FFMPEG_TIMEOUT_S = 15.0
 
@@ -265,12 +266,51 @@ def _resolve_url_to_local(url_or_path: str) -> Optional[Path]:
 
 
 def _fetch_remote_to(
-    temp_path: Path, url: str, *, timeout: float = _OUTBOUND_FETCH_TIMEOUT_S
+    temp_path: Path,
+    url: str,
+    *,
+    timeout: float = _OUTBOUND_FETCH_TIMEOUT_S,
+    max_bytes: int = _OUTBOUND_MAX_FETCH_BYTES,
 ) -> None:
-    """Download a URL to a local path (synchronous, blocking)."""
+    """Download a URL to a local path (synchronous, blocking).
+
+    Streams in chunks and enforces a size cap to prevent disk exhaustion:
+    aborts before downloading if Content-Length advertises over the cap, and
+    aborts mid-stream if the running byte total exceeds it. On abort the
+    partial temp file is removed and a ValueError is raised so callers fall
+    back to text.
+    """
     with urllib.request.urlopen(url, timeout=timeout) as response:
-        with open(temp_path, "wb") as f:
-            shutil.copyfileobj(response, f)
+        declared = response.headers.get("Content-Length")
+        if declared is not None:
+            try:
+                if int(declared) > max_bytes:
+                    raise ValueError(
+                        f"remote file exceeds {max_bytes} bytes"
+                    )
+            except (TypeError, ValueError) as e:
+                # Re-raise our own cap error; ignore an unparseable header.
+                if isinstance(e, ValueError) and "exceeds" in str(e):
+                    raise
+        total = 0
+        try:
+            with open(temp_path, "wb") as f:
+                while True:
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(
+                            f"remote file exceeds {max_bytes} bytes"
+                        )
+                    f.write(chunk)
+        except BaseException:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+            raise
 
 
 def _translate_daemon_path(
@@ -848,16 +888,26 @@ class SimplexAdapter(BasePlatformAdapter):
 
         local = _resolve_url_to_local(src_url_or_path)
         if local is not None:
+            # Decide "already in place" only on fully-resolved paths so a
+            # crafted symlink or '..' can't pose as in-root. If resolution
+            # fails, treat the source as NOT under root and fall through to
+            # the copy-into-staging branch — never trust unresolved paths.
+            already_in_root = False
             try:
-                local_resolved = local.resolve()
-                host_resolved = host_root.resolve()
-            except OSError:
-                local_resolved, host_resolved = local, host_root
-            if str(local_resolved).startswith(str(host_resolved) + os.sep) or local_resolved == host_resolved:
+                already_in_root = local.resolve().is_relative_to(
+                    host_root.resolve()
+                )
+            except (OSError, ValueError):
+                already_in_root = False
+            if already_in_root:
                 # Already in the bind-mount; no copy needed.
                 return local, local.name
             # Copy into the staging dir under the original basename, with a
             # uuid prefix to avoid collisions across simultaneous sends.
+            # NOTE: staged copies are intentionally NOT deleted after send —
+            # the daemon reads the file asynchronously, so deleting now would
+            # race that read. Point SIMPLEX_FILE_DIR at storage operators can
+            # periodically prune.
             staged_name = f"{uuid.uuid4().hex[:8]}-{local.name}"
             staged = host_root / staged_name
             try:
@@ -870,9 +920,21 @@ class SimplexAdapter(BasePlatformAdapter):
         # Remote URL — download. Use the URL's basename if it looks like a
         # filename, otherwise fall back to a uuid + guessed extension.
         parsed = urllib.parse.urlparse(src_url_or_path)
+        # Only http(s) reaches urlopen; any other scheme is unsupported so
+        # _send_media falls back to text. (file:// is handled above via
+        # _resolve_url_to_local.)
+        if parsed.scheme not in ("http", "https"):
+            logger.warning(
+                "SimpleX: unsupported URL scheme for outbound media: %s",
+                parsed.scheme or "(none)",
+            )
+            return None
         url_name = Path(parsed.path).name or ""
         staged_name = f"{uuid.uuid4().hex[:8]}-{url_name}" if url_name else f"{uuid.uuid4().hex}.bin"
         staged = host_root / staged_name
+        # NOTE: downloaded files are intentionally NOT deleted after send —
+        # the daemon reads asynchronously; deleting now would race that read.
+        # Operators should periodically prune SIMPLEX_FILE_DIR.
         try:
             await asyncio.to_thread(_fetch_remote_to, staged, src_url_or_path)
         except Exception as e:
