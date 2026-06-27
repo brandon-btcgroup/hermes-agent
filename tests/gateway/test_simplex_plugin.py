@@ -7,6 +7,7 @@ sibling platform-plugin tests on the same xdist worker.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -328,6 +329,7 @@ async def test_group_sender_from_chatdir_groupmember():
     from gateway.config import PlatformConfig
     cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
     adapter = SimplexAdapter(cfg)
+    adapter._text_batch_delay = 0  # isolate sender extraction from batching
     captured = AsyncMock()
     adapter.handle_message = captured  # type: ignore
 
@@ -575,4 +577,68 @@ async def test_image_file_still_sets_photo_type():
     await adapter._handle_chat_item(_make_file_chat_item("/tmp/pic.jpg", "pic.jpg"))
 
     assert dispatched, "_handle_chat_item did not dispatch any event"
+    assert dispatched[0].message_type == MessageType.PHOTO
+
+
+# ---------------------------------------------------------------------------
+# 10. Inbound text batching (opt-in via HERMES_SIMPLEX_TEXT_BATCH_DELAY)
+# ---------------------------------------------------------------------------
+
+def _dm_text_wrapper(contact_id: int, text: str) -> dict:
+    """Minimal direct-chat received text item."""
+    return {
+        "chatInfo": {
+            "type": "direct",
+            "contact": {"contactId": contact_id, "displayName": "u"},
+        },
+        "chatItem": {
+            "content": {"msgContent": {"type": "text", "text": text}},
+            "meta": {"itemStatus": {"type": "rcvNew"}, "itemId": 1},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_text_batching_combines_rapid_dm_messages():
+    """Rapid-fire text from one chat collapses into a single dispatch."""
+    from gateway.config import PlatformConfig
+
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+    adapter._text_batch_delay = 0.02
+    dispatched = []
+
+    async def _capture(event):
+        dispatched.append(event)
+
+    adapter.handle_message = _capture
+
+    await adapter._handle_chat_item(_dm_text_wrapper(1, "hey"))
+    await adapter._handle_chat_item(_dm_text_wrapper(1, "you there?"))
+    # Still within the quiet window — nothing dispatched yet.
+    assert dispatched == []
+
+    await asyncio.gather(*adapter._pending_text_batch_tasks.values())
+    assert len(dispatched) == 1
+    assert dispatched[0].text == "hey\nyou there?"
+
+
+@pytest.mark.asyncio
+async def test_text_batching_bypassed_for_media_messages():
+    """Media messages dispatch immediately even when batching is enabled."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+    adapter._text_batch_delay = 999  # would defer ~forever if it applied
+    dispatched = []
+
+    async def _capture(event):
+        dispatched.append(event)
+
+    adapter.handle_message = _capture
+
+    await adapter._handle_chat_item(_make_file_chat_item("/tmp/pic.jpg", "pic.jpg"))
+    assert len(dispatched) == 1
     assert dispatched[0].message_type == MessageType.PHOTO

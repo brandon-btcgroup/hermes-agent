@@ -39,6 +39,11 @@ Optional environment variables:
                                /root/.simplex/files). Used together
                                with SIMPLEX_FILE_DIR for path
                                translation on outbound sends.
+    HERMES_SIMPLEX_TEXT_BATCH_DELAY
+                               Quiet-period seconds (default: 0.8) used to
+                               concatenate rapid-fire inbound text messages
+                               into a single MessageEvent. Set to 0 to
+                               disable batching. Skipped during replay.
 
 The ``websockets`` Python package is imported lazily — the plugin is
 discoverable and `hermes setup` can describe it even when websockets is
@@ -102,6 +107,10 @@ _CORR_PREFIX = "hermes-"
 _REPLAY_DEFAULT_MAX_ITEMS = 200
 _REPLAY_DEFAULT_PAGE_SIZE = 50
 _REPLAY_RESPONSE_TIMEOUT_S = 15.0
+
+# Inbound text-batching quiet period (seconds). On by default; set
+# HERMES_SIMPLEX_TEXT_BATCH_DELAY=0 to disable.
+_DEFAULT_TEXT_BATCH_DELAY = 0.8
 
 # Outbound media defaults — see _make_image_thumbnail, _probe_duration_*
 _THUMBNAIL_MAX_PX = 224
@@ -434,6 +443,28 @@ class SimplexAdapter(BasePlatformAdapter):
         # from cron jobs + live messages don't interleave on the WS.
         self._send_lock = asyncio.Lock()
 
+        # Inbound text batching. Concatenate rapid-fire text messages from the
+        # same chat into one dispatch, mirroring Telegram. On by default
+        # (_DEFAULT_TEXT_BATCH_DELAY); set HERMES_SIMPLEX_TEXT_BATCH_DELAY=0 to
+        # disable. The replay cursor advances only after a batch flushes (see
+        # _flush_text_batch) so a crash mid-batch replays the messages instead
+        # of losing them, and batching is skipped entirely during replay.
+        try:
+            self._text_batch_delay = max(
+                0.0,
+                float(
+                    os.getenv(
+                        "HERMES_SIMPLEX_TEXT_BATCH_DELAY",
+                        str(_DEFAULT_TEXT_BATCH_DELAY),
+                    )
+                ),
+            )
+        except ValueError:
+            self._text_batch_delay = _DEFAULT_TEXT_BATCH_DELAY
+        self._pending_text_batches: Dict[str, MessageEvent] = {}
+        self._pending_text_batch_items: Dict[str, List[Tuple[int, int]]] = {}
+        self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+
         logger.info("SimpleX adapter initialized: url=%s", self.ws_url)
 
     # ------------------------------------------------------------------
@@ -530,6 +561,16 @@ class SimplexAdapter(BasePlatformAdapter):
             if not fut.done():
                 fut.cancel()
         self._pending_responses.clear()
+
+        # Drop pending text batches. Their items were never marked dispatched
+        # (the cursor advances only on flush), so replay re-fetches them on
+        # reconnect — nothing is lost.
+        for task in list(self._pending_text_batch_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._pending_text_batch_tasks.clear()
+        self._pending_text_batches.clear()
+        self._pending_text_batch_items.clear()
 
         logger.info("SimpleX: disconnected")
 
@@ -663,8 +704,15 @@ class SimplexAdapter(BasePlatformAdapter):
                 await self._handle_chat_item(item_wrapper)
         # Ignore all other event types (delivery receipts, contact updates, etc.)
 
-    async def _handle_chat_item(self, wrapper: dict) -> None:
-        """Process a single newChatItem event into a MessageEvent."""
+    async def _handle_chat_item(
+        self, wrapper: dict, *, from_replay: bool = False
+    ) -> None:
+        """Process a single newChatItem event into a MessageEvent.
+
+        ``from_replay`` is set when this is driven by the missed-message
+        replay loop; it forces immediate dispatch (text batching, which is
+        a live-stream optimisation, is skipped during replay).
+        """
         # The daemon wraps the chat item differently depending on version;
         # normalise both layouts.
         chat_info = wrapper.get("chatInfo") or wrapper.get("chat") or {}
@@ -822,10 +870,12 @@ class SimplexAdapter(BasePlatformAdapter):
         )
 
         # Replay dedupe: groups only (item ids aren't unique across chats,
-        # and DM replay isn't implemented yet). Skip if we've already seen
-        # this (group_id, item_id) tuple in the dedupe ring, otherwise mark
-        # and dispatch. The cursor advances after a successful dispatch so
-        # a crash mid-handler doesn't skip the message on next start.
+        # and DM replay isn't implemented yet). Compute the (group, item)
+        # key and skip anything already in the dedupe ring. The cursor is
+        # advanced only after a successful dispatch (or batch flush) so a
+        # crash mid-handler doesn't skip the message on next start.
+        gid_int: Optional[int] = None
+        item_id_int: Optional[int] = None
         if self._replay_state is not None and is_group:
             try:
                 gid_int = int(group_id)
@@ -834,15 +884,100 @@ class SimplexAdapter(BasePlatformAdapter):
             except (TypeError, ValueError):
                 gid_int = None
                 item_id_int = None
-            if gid_int is not None and item_id_int is not None:
-                if self._replay_state.already_dispatched(gid_int, item_id_int):
-                    return
-                self._replay_state.mark_dispatched(gid_int, item_id_int)
-                await self.handle_message(event_obj)
-                self._replay_state.update_cursor(gid_int, item_id_int)
+            if (
+                gid_int is not None
+                and item_id_int is not None
+                and self._replay_state.already_dispatched(gid_int, item_id_int)
+            ):
                 return
 
-        await self.handle_message(event_obj)
+        # Opt-in text batching — live stream only, text only. Replayed items
+        # and media messages always dispatch immediately.
+        if (
+            self._text_batch_delay > 0
+            and not from_replay
+            and msg_type == MessageType.TEXT
+            and text
+        ):
+            self._enqueue_text_event(event_obj, chat_id, gid_int, item_id_int)
+            return
+
+        await self._dispatch_event(event_obj, gid_int, item_id_int)
+
+    async def _dispatch_event(
+        self,
+        event_obj: MessageEvent,
+        gid_int: Optional[int],
+        item_id_int: Optional[int],
+    ) -> None:
+        """Dispatch one event, advancing the group replay cursor afterwards."""
+        if (
+            self._replay_state is not None
+            and gid_int is not None
+            and item_id_int is not None
+        ):
+            self._replay_state.mark_dispatched(gid_int, item_id_int)
+            await self.handle_message(event_obj)
+            self._replay_state.update_cursor(gid_int, item_id_int)
+        else:
+            await self.handle_message(event_obj)
+
+    # ------------------------------------------------------------------
+    # Inbound text batching
+    # ------------------------------------------------------------------
+
+    def _enqueue_text_event(
+        self,
+        event_obj: MessageEvent,
+        chat_id: str,
+        gid_int: Optional[int],
+        item_id_int: Optional[int],
+    ) -> None:
+        """Buffer a text event for ``chat_id`` and (re)arm the flush timer."""
+        existing = self._pending_text_batches.get(chat_id)
+        if existing is None:
+            self._pending_text_batches[chat_id] = event_obj
+            self._pending_text_batch_items[chat_id] = []
+        else:
+            if event_obj.text:
+                existing.text = (
+                    f"{existing.text}\n{event_obj.text}"
+                    if existing.text
+                    else event_obj.text
+                )
+            if event_obj.media_urls:
+                existing.media_urls.extend(event_obj.media_urls)
+                existing.media_types.extend(event_obj.media_types)
+        if gid_int is not None and item_id_int is not None:
+            self._pending_text_batch_items[chat_id].append((gid_int, item_id_int))
+
+        prior = self._pending_text_batch_tasks.get(chat_id)
+        if prior and not prior.done():
+            prior.cancel()
+        self._pending_text_batch_tasks[chat_id] = asyncio.create_task(
+            self._flush_text_batch(chat_id)
+        )
+
+    async def _flush_text_batch(self, chat_id: str) -> None:
+        """After the quiet period, dispatch the combined event and advance
+        the replay cursor for every item the batch covered."""
+        current = asyncio.current_task()
+        try:
+            await asyncio.sleep(self._text_batch_delay)
+            event_obj = self._pending_text_batches.pop(chat_id, None)
+            covered = self._pending_text_batch_items.pop(chat_id, [])
+            if event_obj is None:
+                return
+            await self.handle_message(event_obj)
+            # Advance replay state only now that the batch is handled, so a
+            # crash before flush replays the messages instead of losing them.
+            if self._replay_state is not None:
+                for gid_int, item_id_int in covered:
+                    self._replay_state.mark_dispatched(gid_int, item_id_int)
+                    self._replay_state.update_cursor(gid_int, item_id_int)
+        finally:
+            if self._pending_text_batch_tasks.get(chat_id) is current:
+                self._pending_text_batch_tasks.pop(chat_id, None)
 
     async def _fetch_file(
         self,
@@ -1028,7 +1163,7 @@ class SimplexAdapter(BasePlatformAdapter):
                 # Wrap into the shape _handle_chat_item expects (chatInfo
                 # alongside the bare chatItem from the /_get response).
                 wrapper = {"chatInfo": chat_info, "chatItem": chat_item}
-                await self._handle_chat_item(wrapper)
+                await self._handle_chat_item(wrapper, from_replay=True)
                 dispatched += 1
                 if dispatched >= max_items:
                     break

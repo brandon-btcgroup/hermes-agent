@@ -137,6 +137,7 @@ def _adapter(monkeypatch, **env) -> SimplexAdapter:
         "SIMPLEX_REPLAY_DISABLED",
         "SIMPLEX_REPLAY_MAX_ITEMS",
         "SIMPLEX_REPLAY_PAGE_SIZE",
+        "HERMES_SIMPLEX_TEXT_BATCH_DELAY",
     ):
         monkeypatch.delenv(k, raising=False)
     for k, v in env.items():
@@ -386,6 +387,7 @@ def test_live_handler_skips_already_dispatched(monkeypatch, tmp_path):
 def test_live_handler_dispatches_and_advances_cursor(monkeypatch, tmp_path):
     adapter = _adapter(monkeypatch)
     adapter._replay_state = _replay.ReplayState(tmp_path / "cursors.json")
+    adapter._text_batch_delay = 0  # isolate the synchronous dispatch path
     adapter.handle_message = AsyncMock()
 
     wrapper = {
@@ -404,6 +406,7 @@ def test_live_handler_dispatches_and_advances_cursor(monkeypatch, tmp_path):
 def test_live_handler_without_replay_state_dispatches_normally(monkeypatch):
     adapter = _adapter(monkeypatch, SIMPLEX_REPLAY_DISABLED="true")
     adapter._replay_state = None
+    adapter._text_batch_delay = 0  # isolate the synchronous dispatch path
     adapter.handle_message = AsyncMock()
 
     wrapper = {
@@ -421,6 +424,7 @@ def test_live_handler_passes_through_dm_without_dedupe(monkeypatch, tmp_path):
     """DMs aren't deduped — cursor logic is groups-only in this PR."""
     adapter = _adapter(monkeypatch)
     adapter._replay_state = _replay.ReplayState(tmp_path / "cursors.json")
+    adapter._text_batch_delay = 0  # isolate the synchronous dispatch path
     adapter.handle_message = AsyncMock()
 
     wrapper = {
@@ -434,3 +438,87 @@ def test_live_handler_passes_through_dm_without_dedupe(monkeypatch, tmp_path):
     adapter.handle_message.assert_awaited_once()
     # No cursor for the contact id — group cursor logic skipped for DMs.
     assert adapter._replay_state.known_groups() == []
+
+
+# ---------------------------------------------------------------------------
+# 6. Inbound text batching (opt-in) + replay interaction
+# ---------------------------------------------------------------------------
+
+def _group_text_wrapper(*, group_id: int, item_id: int, text: str) -> dict:
+    return {
+        "chatInfo": {
+            "type": "group",
+            "groupInfo": {"groupId": group_id, "displayName": f"g{group_id}"},
+        },
+        "chatItem": _make_text_item(item_id=item_id, text=text),
+    }
+
+
+def test_text_batch_combines_group_items_and_advances_cursor(monkeypatch, tmp_path):
+    """Rapid live text in one group collapses to a single dispatch, and the
+    replay cursor advances for EVERY batched item — only after the flush."""
+    adapter = _adapter(monkeypatch)
+    adapter._replay_state = _replay.ReplayState(tmp_path / "cursors.json")
+    adapter._text_batch_delay = 0.02
+    dispatched: list[str] = []
+    adapter.handle_message = AsyncMock(
+        side_effect=lambda ev: dispatched.append(ev.text)
+    )
+
+    async def run():
+        await adapter._handle_chat_item(
+            _group_text_wrapper(group_id=7, item_id=10, text="a")
+        )
+        await adapter._handle_chat_item(
+            _group_text_wrapper(group_id=7, item_id=11, text="b")
+        )
+        # Within the quiet window: nothing dispatched, cursor not advanced.
+        assert dispatched == []
+        assert adapter._replay_state.get_cursor(7) is None
+        await asyncio.gather(*adapter._pending_text_batch_tasks.values())
+
+    asyncio.run(run())
+    assert dispatched == ["a\nb"]
+    assert adapter._replay_state.get_cursor(7) == 11
+    assert adapter._replay_state.already_dispatched(7, 10)
+    assert adapter._replay_state.already_dispatched(7, 11)
+
+
+def test_replay_path_bypasses_batching(monkeypatch, tmp_path):
+    """Replayed items must dispatch immediately — never wait on the batch
+    timer (which would also wrongly merge historical messages)."""
+    adapter = _adapter(monkeypatch)
+    adapter._replay_state = _replay.ReplayState(tmp_path / "cursors.json")
+    adapter._text_batch_delay = 999  # would defer ~forever if batching applied
+    adapter.handle_message = AsyncMock()
+
+    asyncio.run(
+        adapter._handle_chat_item(
+            _group_text_wrapper(group_id=7, item_id=10, text="hi"),
+            from_replay=True,
+        )
+    )
+    adapter.handle_message.assert_awaited_once()
+    assert adapter._pending_text_batch_tasks == {}
+
+
+def test_batching_on_by_default(monkeypatch):
+    """Batching is enabled out of the box at the module default delay."""
+    adapter = _adapter(monkeypatch)
+    assert adapter._text_batch_delay == _simplex._DEFAULT_TEXT_BATCH_DELAY
+
+
+def test_batching_explicit_zero_disables(monkeypatch, tmp_path):
+    """HERMES_SIMPLEX_TEXT_BATCH_DELAY=0 restores immediate dispatch."""
+    adapter = _adapter(monkeypatch, HERMES_SIMPLEX_TEXT_BATCH_DELAY="0")
+    adapter._replay_state = _replay.ReplayState(tmp_path / "cursors.json")
+    adapter.handle_message = AsyncMock()
+    assert adapter._text_batch_delay == 0.0
+
+    asyncio.run(
+        adapter._handle_chat_item(
+            _group_text_wrapper(group_id=7, item_id=10, text="hi")
+        )
+    )
+    adapter.handle_message.assert_awaited_once()
+    assert adapter._pending_text_batch_tasks == {}
