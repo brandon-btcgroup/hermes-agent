@@ -655,15 +655,15 @@ class SimplexAdapter(BasePlatformAdapter):
             return
 
         if resp_type == "newChatItem":
-            await self._handle_new_chat_item(resp)
+            await self._handle_chat_item(resp)
         elif resp_type == "newChatItems":
             # Batch variant — process each item
             items = resp.get("chatItems") or []
             for item_wrapper in items:
-                await self._handle_new_chat_item(item_wrapper)
+                await self._handle_chat_item(item_wrapper)
         # Ignore all other event types (delivery receipts, contact updates, etc.)
 
-    async def _handle_new_chat_item(self, wrapper: dict) -> None:
+    async def _handle_chat_item(self, wrapper: dict) -> None:
         """Process a single newChatItem event into a MessageEvent."""
         # The daemon wraps the chat item differently depending on version;
         # normalise both layouts.
@@ -742,30 +742,46 @@ class SimplexAdapter(BasePlatformAdapter):
             file_id = file_info.get("fileId")
             file_name = file_info.get("fileName", "file")
             # The daemon may already have the file on disk under
-            # fileSource.filePath (container-side path). Pass it through
-            # so _fetch_file can translate it via the bind-mount mapping.
+            # fileSource.filePath (container-side path).
             file_source = file_info.get("fileSource") or {}
             daemon_path = (
                 file_source.get("filePath")
                 or file_info.get("filePath")
                 or ""
             )
-            if file_id:
+            resolved_url: Optional[str] = None
+            resolved_ext = ""
+            # Containerised deployments: translate the daemon path to the
+            # host via the bind-mount mapping and cache the bytes locally.
+            if self._host_files_dir and file_id:
                 try:
                     cached = await self._fetch_file(
                         file_id, file_name, daemon_path=daemon_path
                     )
-                    if cached:
-                        ext = cached.rsplit(".", 1)[-1]
-                        if _is_image_ext("." + ext):
-                            media_types.append("image/" + ext.replace("jpg", "jpeg"))
-                        elif _is_audio_ext("." + ext):
-                            media_types.append("audio/" + ext)
-                        else:
-                            media_types.append("application/octet-stream")
-                        media_urls.append(cached)
                 except Exception:
                     logger.exception("SimpleX: failed to fetch file %s", file_id)
+                    cached = None
+                if cached:
+                    resolved_url = cached
+                    resolved_ext = "." + cached.rsplit(".", 1)[-1]
+            # Shared-filesystem deployments: the daemon-reported path is
+            # directly readable, so surface it and classify by its suffix.
+            if resolved_url is None and daemon_path:
+                resolved_url = daemon_path
+                resolved_ext = (
+                    Path(daemon_path).suffix.lower()
+                    or (Path(file_name).suffix.lower() if file_name else "")
+                )
+            if resolved_url:
+                if _is_image_ext(resolved_ext):
+                    media_types.append(
+                        "image/" + resolved_ext.lstrip(".").replace("jpg", "jpeg")
+                    )
+                elif _is_audio_ext(resolved_ext):
+                    media_types.append("audio/" + resolved_ext.lstrip("."))
+                else:
+                    media_types.append("application/octet-stream")
+                media_urls.append(resolved_url)
 
         # Timestamp
         ts_str = meta.get("itemTs") or meta.get("createdAt") or ""
@@ -790,6 +806,10 @@ class SimplexAdapter(BasePlatformAdapter):
                 msg_type = MessageType.VOICE
             elif any(mt.startswith("image/") for mt in media_types):
                 msg_type = MessageType.PHOTO
+            else:
+                # Non-image/non-audio files classify as DOCUMENT so run.py's
+                # document-context injection surfaces the file to the agent.
+                msg_type = MessageType.DOCUMENT
 
         event_obj = MessageEvent(
             source=source,
@@ -1005,10 +1025,10 @@ class SimplexAdapter(BasePlatformAdapter):
                 item_id = meta.get("itemId")
                 if isinstance(item_id, int) and item_id > next_after:
                     next_after = item_id
-                # Wrap into the shape _handle_new_chat_item expects (chatInfo
+                # Wrap into the shape _handle_chat_item expects (chatInfo
                 # alongside the bare chatItem from the /_get response).
                 wrapper = {"chatInfo": chat_info, "chatItem": chat_item}
-                await self._handle_new_chat_item(wrapper)
+                await self._handle_chat_item(wrapper)
                 dispatched += 1
                 if dispatched >= max_items:
                     break

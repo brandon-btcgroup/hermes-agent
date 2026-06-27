@@ -4,7 +4,7 @@ Covers:
   - ReplayState cursor file persistence + dedupe ring semantics
   - Adapter _send_and_wait corrId/response Future plumbing
   - Adapter _replay_group pagination + dedupe interaction
-  - Adapter _handle_new_chat_item dedupe check + cursor advance
+  - Adapter _handle_chat_item dedupe check + cursor advance
 
 The adapter module is loaded via the shared ``_plugin_adapter_loader``
 so it lives under a unique sys.modules key. ``_replay`` is loaded via
@@ -363,7 +363,7 @@ def test_replay_group_aborts_on_timeout(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 5. Live message dedupe through _handle_new_chat_item
+# 5. Live message dedupe through _handle_chat_item
 # ---------------------------------------------------------------------------
 
 def test_live_handler_skips_already_dispatched(monkeypatch, tmp_path):
@@ -379,7 +379,7 @@ def test_live_handler_skips_already_dispatched(monkeypatch, tmp_path):
         },
         "chatItem": _make_text_item(item_id=42, text="dup"),
     }
-    asyncio.run(adapter._handle_new_chat_item(wrapper))
+    asyncio.run(adapter._handle_chat_item(wrapper))
     adapter.handle_message.assert_not_awaited()
 
 
@@ -395,7 +395,7 @@ def test_live_handler_dispatches_and_advances_cursor(monkeypatch, tmp_path):
         },
         "chatItem": _make_text_item(item_id=42, text="fresh"),
     }
-    asyncio.run(adapter._handle_new_chat_item(wrapper))
+    asyncio.run(adapter._handle_chat_item(wrapper))
     adapter.handle_message.assert_awaited_once()
     assert adapter._replay_state.get_cursor(7) == 42
     assert adapter._replay_state.already_dispatched(7, 42)
@@ -413,7 +413,7 @@ def test_live_handler_without_replay_state_dispatches_normally(monkeypatch):
         },
         "chatItem": _make_text_item(item_id=42, text="hi"),
     }
-    asyncio.run(adapter._handle_new_chat_item(wrapper))
+    asyncio.run(adapter._handle_chat_item(wrapper))
     adapter.handle_message.assert_awaited_once()
 
 
@@ -430,7 +430,7 @@ def test_live_handler_passes_through_dm_without_dedupe(monkeypatch, tmp_path):
         },
         "chatItem": _make_text_item(item_id=1, text="hi"),
     }
-    asyncio.run(adapter._handle_new_chat_item(wrapper))
+    asyncio.run(adapter._handle_chat_item(wrapper))
     adapter.handle_message.assert_awaited_once()
     # No cursor for the contact id — group cursor logic skipped for DMs.
     assert adapter._replay_state.known_groups() == []
