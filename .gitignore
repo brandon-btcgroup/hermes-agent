@@ -147,3 +147,13 @@ apps/desktop/demo/
 # PR body is the archive. See the hermes-agent-dev skill's
 # pr-infographic-workflow reference (storage rule + lapse #8 / #COMMIT-1).
 infographic/
+
+# pytest basetemp dropped in the repo root by some test runs. Regenerable.
+pytest-of-*/
+
+# Stray hash-named uv lock scratch files (e.g. uv-<hash>.lock). NOT uv.lock.
+uv-*.lock
+
+# Personal Claude Code permission allowlist — machine-local, never shared.
+# (The shared .claude/settings.json IS committed.)
+.claude/settings.local.json
