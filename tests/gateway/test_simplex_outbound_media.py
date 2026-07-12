@@ -508,3 +508,34 @@ def test_send_animation_aliases_to_video(monkeypatch, tmp_path):
     asyncio.run(adapter.send_animation("group:9", str(src)))
     body = json.loads(_sent_payload(adapter)["cmd"].split("json ", 1)[1])
     assert body[0]["msgContent"]["type"] == "video"
+
+
+def test_media_senders_accept_framework_keyword_contract():
+    """Regression (0.18 sync): the gateway framework AND the base class dispatch
+    outbound media by keyword — send_image_file(image_path=...),
+    send_voice(audio_path=...), send_video(video_path=...),
+    send_document(file_path=...), send_animation(animation_url=...). Our
+    overrides must accept those contract names (every sibling adapter does) or
+    outbound media raises 'unexpected keyword argument' at runtime.
+    """
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://x:5225"})
+    )
+    adapter._send_media = AsyncMock(return_value=MagicMock(success=True))
+
+    async def _run():
+        await adapter.send_image_file(chat_id="g:1", image_path="/t/a.png", caption="c", metadata={})
+        await adapter.send_voice(chat_id="g:1", audio_path="/t/a.ogg", metadata={})
+        await adapter.send_video(chat_id="g:1", video_path="/t/a.mp4", metadata={})
+        await adapter.send_document(chat_id="g:1", file_path="/t/a.pdf", metadata={})
+        await adapter.send_animation(chat_id="g:1", animation_url="/t/a.gif", metadata={})
+
+    asyncio.run(_run())
+
+    # _send_media(chat_id, kind, path, caption) — path is positional arg[2]
+    forwarded = [c.args[2] for c in adapter._send_media.await_args_list]
+    assert forwarded == ["/t/a.png", "/t/a.ogg", "/t/a.mp4", "/t/a.pdf", "/t/a.gif"]
+    kinds = [c.args[1] for c in adapter._send_media.await_args_list]
+    assert kinds == ["image", "voice", "video", "file", "video"]

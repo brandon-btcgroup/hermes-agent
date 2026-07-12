@@ -284,6 +284,41 @@ async def test_send_when_ws_not_connected_does_not_crash():
     assert result.success is True  # send() always returns success — fire-and-forget
 
 
+@pytest.mark.asyncio
+async def test_connect_accepts_is_reconnect_kwarg(monkeypatch):
+    """Regression (0.18 sync): the gateway framework calls
+    ``adapter.connect(is_reconnect=...)`` (gateway/run.py). Every sibling
+    adapter honors that keyword-only contract; ours must too, or SimpleX dies
+    at startup with 'connect() got an unexpected keyword argument is_reconnect'.
+    """
+    from contextlib import asynccontextmanager
+    from gateway.config import PlatformConfig
+
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+    adapter._replay_disabled = True  # skip on-disk cursor init
+
+    @asynccontextmanager
+    async def _fake_ws_connect(*a, **k):
+        yield AsyncMock()
+
+    import websockets
+    monkeypatch.setattr(websockets, "connect", _fake_ws_connect)
+
+    async def _noop():
+        return None
+    monkeypatch.setattr(adapter, "_ws_listener", _noop)
+    monkeypatch.setattr(adapter, "_health_monitor", _noop)
+
+    try:
+        assert await adapter.connect(is_reconnect=True) is True
+    finally:
+        for t in (getattr(adapter, "_ws_task", None),
+                  getattr(adapter, "_health_task", None)):
+            if t is not None:
+                t.cancel()
+
+
 # ---------------------------------------------------------------------------
 # 8. Inbound: filter own-echo by corrId prefix
 # ---------------------------------------------------------------------------

@@ -471,8 +471,15 @@ class SimplexAdapter(BasePlatformAdapter):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
-        """Connect to the simplex-chat daemon and start the WebSocket listener."""
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Connect to the simplex-chat daemon and start the WebSocket listener.
+
+        ``is_reconnect`` is part of the gateway's adapter contract (the
+        framework passes it on supervisory reconnects). Our replay cursors are
+        disk-backed and ``_init_replay_state`` is idempotent, so cold-start and
+        reconnect share the same path; the flag is accepted for contract
+        conformance and future use.
+        """
         try:
             import websockets  # noqa: F401
         except ImportError:
@@ -1360,55 +1367,66 @@ class SimplexAdapter(BasePlatformAdapter):
         dir first. Degrades to a text URL when SIMPLEX_FILE_DIR is unset."""
         return await self._send_media(chat_id, "image", image_url, caption)
 
+    # NOTE: parameter names below match the gateway's adapter contract
+    # (base.py) — the framework and base class dispatch media by keyword
+    # (image_path=, audio_path=, video_path=, file_path=, animation_url=).
+    # ``**kwargs`` absorbs contract params SimpleX doesn't use.
     async def send_image_file(
         self,
         chat_id: str,
-        path: str,
+        image_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> SendResult:
-        return await self._send_media(chat_id, "image", path, caption)
+        return await self._send_media(chat_id, "image", image_path, caption)
 
     async def send_voice(
         self,
         chat_id: str,
-        path: str,
+        audio_path: str,
+        caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> SendResult:
-        return await self._send_media(chat_id, "voice", path, None)
+        return await self._send_media(chat_id, "voice", audio_path, caption)
 
     async def send_video(
         self,
         chat_id: str,
-        path: str,
+        video_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> SendResult:
-        return await self._send_media(chat_id, "video", path, caption)
+        return await self._send_media(chat_id, "video", video_path, caption)
 
     async def send_document(
         self,
         chat_id: str,
-        path: str,
+        file_path: str,
         caption: Optional[str] = None,
+        file_name: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> SendResult:
-        return await self._send_media(chat_id, "file", path, caption)
+        return await self._send_media(chat_id, "file", file_path, caption)
 
     async def send_animation(
         self,
         chat_id: str,
-        path: str,
+        animation_url: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> SendResult:
         # SimpleX doesn't distinguish animation from video on the wire.
-        return await self._send_media(chat_id, "video", path, caption)
+        return await self._send_media(chat_id, "video", animation_url, caption)
 
     async def get_chat_info(self, chat_id: str) -> dict:
         """Return basic chat info."""
