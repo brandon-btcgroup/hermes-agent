@@ -362,3 +362,27 @@ def test_simplex_command_unknown_action_exits_with_usage(capsys):
         _cli.simplex_command(_ns(simplex_action=None))
     assert exc.value.code == 2
     assert "usage" in capsys.readouterr().err
+
+
+def test_hermes_simplex_subcommand_registered_end_to_end():
+    """Regression (0.18 sync): 0.18 lazy-loads platform plugins, so their
+    ``register()`` (which calls ``register_cli_command``) never ran during CLI
+    discovery and ``hermes simplex`` became an 'invalid choice'. The discovery
+    block now scope-loads the matching platform. Invoke the REAL CLI end-to-end
+    (the isolated cli.py tests above can't catch a discovery/registration gap).
+    """
+    import os
+    import subprocess
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "simplex", "--help"],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env={**os.environ, "HERMES_SKIP_UPDATE_CHECK": "1"},
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out[-2000:]
+    assert "invalid choice" not in out
+    assert "list" in out and "join" in out

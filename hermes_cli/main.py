@@ -13226,6 +13226,25 @@ def main():
                 seen_plugin_commands.add(cmd_info["name"])
 
             discover_plugins()
+            # Fork delta (0.18 sync): platform plugins load lazily
+            # (_register_deferred_platform), so their register() — which calls
+            # register_cli_command — hasn't run during CLI discovery. That
+            # drops platform-contributed subcommands like ``hermes simplex``.
+            # Scope-load only the deferred platform whose name matches the
+            # invoked token, so ``hermes <platform> ...`` resolves without
+            # eager-importing every platform adapter on unrelated invocations.
+            _plat_tok = _first_positional_argv()
+            if _plat_tok and _plat_tok not in _BUILTIN_SUBCOMMANDS:
+                _pm = get_plugin_manager()
+                for _lp in list(getattr(_pm, "_plugins", {}).values()):
+                    _man = getattr(_lp, "manifest", None)
+                    if (
+                        _man is not None
+                        and getattr(_lp, "deferred", False)
+                        and getattr(_man, "kind", None) == "platform"
+                        and _pm._platform_name_from_manifest(_man) == _plat_tok
+                    ):
+                        _pm._load_plugin(_man)
             for cmd_info in get_plugin_manager()._cli_commands.values():
                 if cmd_info["name"] in seen_plugin_commands:
                     continue
