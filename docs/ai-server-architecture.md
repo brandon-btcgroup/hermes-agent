@@ -17,6 +17,26 @@
 | Hermes install | `~/.hermes/hermes-agent` (Python `.venv`), `HERMES_HOME=~/.hermes` |
 | Orchestration | systemd **user** units (`systemctl --user …`) + Podman **Quadlet** |
 
+## Deployment & code integrity ⚠️
+
+- **Code lives at** `~/.hermes/hermes-agent`, **editable uv install** (`.venv`). The
+  running Python processes import from disk at start — a `git checkout` does **not**
+  affect a running process until it is restarted.
+- **Deploy branch:** `feat/simplex-0.16` (the fork). Both it and local `main` now track
+  **`fork/*`** (`fork` = `brandon-btcgroup`). Reinstall after a code change with:
+  `cd ~/.hermes/hermes-agent && uv sync --extra simplex --extra homeassistant`, then
+  restart the affected services.
+- **Required extras:** `simplex` (websockets) + `homeassistant` (`aiohttp`). A plain
+  `uv sync` (no extras) **drops `aiohttp` and breaks Home Assistant.** telegram/slack/etc.
+  lazy-install on first use and are not needed here.
+- **Footgun (fixed 2026-07-16):** local `main` used to track **upstream** (`origin` =
+  NousResearch). On 2026-07-12 a `checkout main; pull --ff-only origin main` silently
+  reverted the box to upstream's SimpleX plugin; it ran upstream — not the fork — until
+  2026-07-16. `main` has been repointed to `fork/main` so this can't recur. Verify the
+  live code is the fork: the SimpleX adapter should show many
+  `TEXT_BATCH_DELAY|replay|groupMember` markers (fork ≈ dozens; upstream ≈ 3), and
+  `hermes simplex --help` must list `{list,join}`.
+
 ## System overview
 
 ```mermaid
