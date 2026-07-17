@@ -16,6 +16,14 @@
 | Service user | `ai-admin` (home `/var/home/ai-admin`, `%h`; `/home` symlinks to `/var/home`) |
 | Hermes install | `~/.hermes/hermes-agent` (Python `.venv`), `HERMES_HOME=~/.hermes` |
 | Orchestration | systemd **user** units (`systemctl --user …`) + Podman **Quadlet** |
+| CLI tooling | **immutable OS (Bazzite/Kinoite, `rpm-ostree`)** — host CLI tools live in a `tools` **distrobox** (Fedora), exported to `~/.local/bin` |
+
+> **Adding host CLI tools** (the base image is read-only, and `sudo` needs a password):
+> `distrobox enter tools -- sudo dnf install -y <pkg>` then
+> `distrobox enter tools -- distrobox-export --bin /usr/bin/<pkg> --export-path ~/.local/bin`.
+> Already installed this way: **`psql`** (PostgreSQL 16 client) and **`gh`** (GitHub CLI).
+> distrobox shares host networking + home, so `psql` reaches `postgresql.localdomain` and
+> `gh` uses `~/.config/gh`. (`gh` still needs `gh auth login` once, interactively.)
 
 ## Deployment & code integrity ⚠️
 
@@ -264,8 +272,8 @@ them as load-bearing.
 > (2) **No SMTP** is configured, so there's no email password reset — recover by writing a
 > Better Auth **scrypt** hash (`N=16384,r=16,p=1,dkLen=64`, format `saltHex:keyHex`, 161
 > chars) straight into `account.password` (Node `crypto.scryptSync`), or delete the single
-> account row and re-sign-up (first account becomes admin). `psql` isn't installed — use a
-> throwaway `postgres:alpine` container with `--network=host`, sourcing `DATABASE_URL` from
+> account row and re-sign-up (first account becomes admin). Query it with `psql`
+> (available via the `tools` distrobox — see below), sourcing `DATABASE_URL` from
 > `~/.config/containers/manifest.env`.
 
 ## Key paths (on `hermes-ai`)
