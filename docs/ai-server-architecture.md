@@ -168,6 +168,89 @@ want Grok. iptv has Home Assistant **disabled** (its `HASS_*` creds are commente
   `SIMPLEX_ALLOW_ALL_USERS=true` exposure on default is closed; dead `SIMPLEX_GROUP_IDS`
   removed from both.
 
+## Broader ai-server stack (non-hermes containers)
+
+The box hosts a full self-hosted AI stack in **Podman Quadlet** containers (units in
+`~/.config/containers/systemd/*.container`) alongside the hermes/simplex pieces. Inventory
+verified 2026-07-16:
+
+| Container | Image | Port(s) | Role |
+|---|---|---|---|
+| `ollama` | `ollama/ollama` | `11434` | Local LLM inference (serves `qwen3-local`, `gemma4-local`, …) |
+| `litellm` | `berriai/litellm` | `4000` | **LLM gateway/proxy** — the hub hermes uses (`ppq-autoclaw`); model list in its own DB (`store_model_in_db`), managed at the :4000 UI |
+| `openwebui` | `open-webui` | `8080` | Web chat UI over the local models |
+| `wyoming-piper` | `rhasspy/wyoming-piper` | `10200` | **TTS** (Wyoming protocol) |
+| `wyoming-faster-whisper` | `linuxserver/faster-whisper:gpu` | `10300` | **STT** (Wyoming, **GPU**) |
+| `openedai-speech` | `matatonic/openedai-speech-min` | `8000` | OpenAI-compatible speech/TTS (XTTS) |
+| `searxng` | `searxng/searxng` | `8888` | Self-hosted metasearch |
+| `firecrawl-redis` | `redis:alpine` | `6379` | Firecrawl queue/cache |
+| `firecrawl-playwright` | `firecrawl/playwright-service` | — | Firecrawl headless browser |
+| *firecrawl API* | node (`dist/api.js`) | `3000` | Firecrawl scrape API (host node process, not a container) |
+| `manifest` | `manifestdotbuild/manifest` | `2099` | "Manifest router" — lightweight backend/API framework |
+| `simplex-chat-hermes` | `localhost/simplex-chat-hermes` | `127.0.0.1:5225` | SimpleX daemon (default) — see above |
+| `simplex-chat-iptv` | `localhost/simplex-chat-hermes` | `127.0.0.1:5226` | SimpleX daemon (iptv) — see above |
+
+> The Wyoming voice ports (10200/10300) and ollama (11434) bind `0.0.0.0` so an **external
+> Home Assistant** (`homeassistant.localdomain:8123`, a *different* host) can reach them for
+> its Assist pipeline. SimpleX daemons stay loopback-only.
+>
+> This machine is also a desktop workstation — `steam`, `kdeconnectd`, `cups` (:631), etc.
+> are host noise, not part of the AI stack.
+
+### How it fits together
+
+Solid = verified this session; dashed = typical wiring, not directly confirmed.
+
+```mermaid
+flowchart LR
+    subgraph ext["External"]
+        ha["Home Assistant<br/>homeassistant.localdomain:8123"]
+        cloud["Cloud LLM providers<br/>(ppq / openrouter / xai / nous)"]
+    end
+
+    subgraph hermes["Hermes (gateways + serve)"]
+        gw["hermes-gateway(-iptv)"]
+        serve["hermes-serve(-iptv)<br/>:9119 / :9120"]
+    end
+
+    subgraph llm["LLM inference & routing"]
+        litellm["litellm :4000"]
+        ollama["ollama :11434"]
+        owui["openwebui :8080"]
+    end
+
+    subgraph voice["Voice (Wyoming)"]
+        piper["wyoming-piper :10200 (TTS)"]
+        whisper["faster-whisper :10300 (STT, GPU)"]
+        oai_speech["openedai-speech :8000"]
+    end
+
+    subgraph websub["Web tools"]
+        searxng["searxng :8888"]
+        firecrawl["firecrawl :3000 (+redis/playwright)"]
+    end
+
+    manifest["manifest :2099"]
+
+    gw -->|"models (ppq-autoclaw)"| litellm
+    litellm --> ollama
+    litellm -.-> cloud
+    gw -.->|"search / scrape"| searxng
+    gw -.->|"scrape"| firecrawl
+    gw -->|"platform"| ha
+    owui -.-> ollama
+    owui -.-> litellm
+    ha -->|"Assist TTS/STT"| piper
+    ha --> whisper
+    ha -.->|"Assist LLM"| ollama
+    oai_speech -.->|"TTS"| owui
+```
+
+**Reading it:** `litellm` is the LLM hub — hermes and openwebui both consume it, and it
+fans out to local `ollama` plus cloud providers. The Wyoming voice trio serves the external
+Home Assistant's Assist pipeline. `searxng` + `firecrawl` back hermes' web tooling. The
+`manifest` router and the desktop apps are independent of the hermes/simplex path.
+
 ## Key paths (on `hermes-ai`)
 
 | Path | What |
