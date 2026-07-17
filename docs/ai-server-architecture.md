@@ -178,14 +178,14 @@ verified 2026-07-16:
 |---|---|---|---|
 | `ollama` | `ollama/ollama` | `11434` | Local LLM inference (serves `qwen3-local`, `gemma4-local`, …) |
 | `litellm` | `berriai/litellm` | `4000` | **LLM gateway/proxy** — the hub hermes uses (`ppq-autoclaw`); model list in its own DB (`store_model_in_db`), managed at the :4000 UI |
-| `openwebui` | `open-webui` | `8080` | Web chat UI over the local models |
+| `openwebui` | `open-webui` | `8080` | Web chat UI — consumes **litellm** (`OPENAI_API_BASE_URL=…:4000`), not ollama directly |
 | `wyoming-piper` | `rhasspy/wyoming-piper` | `10200` | **TTS** (Wyoming protocol) |
 | `wyoming-faster-whisper` | `linuxserver/faster-whisper:gpu` | `10300` | **STT** (Wyoming, **GPU**) |
-| `openedai-speech` | `matatonic/openedai-speech-min` | `8000` | OpenAI-compatible speech/TTS (XTTS) |
-| `searxng` | `searxng/searxng` | `8888` | Self-hosted metasearch |
+| `openedai-speech` | `matatonic/openedai-speech-min` | `8000` | OpenAI-compatible speech/TTS (XTTS) — *no active consumer found* |
+| `searxng` | `searxng/searxng` | `8888` | Self-hosted metasearch — *no active consumer found* (hermes uses Tavily, not this) |
 | `firecrawl-redis` | `redis:alpine` | `6379` | Firecrawl queue/cache |
 | `firecrawl-playwright` | `firecrawl/playwright-service` | — | Firecrawl headless browser |
-| *firecrawl API* | node (`dist/api.js`) | `3000` | Firecrawl scrape API (host node process, not a container) |
+| *firecrawl API* | node (`dist/api.js`) | `3000` | Firecrawl scrape API (host node process) — *no active consumer found; hermes' Firecrawl key is empty* |
 | `manifest` | `manifestdotbuild/manifest` | `2099` | **LLM router** (manifest.build) — an alternative to litellm; dashboard at `http://ai-server.localdomain:2099`, wired to `ollama` via `OLLAMA_HOST`. **Not** currently in the hermes path (standalone/aspirational). |
 | `simplex-chat-hermes` | `localhost/simplex-chat-hermes` | `127.0.0.1:5225` | SimpleX daemon (default) — see above |
 | `simplex-chat-iptv` | `localhost/simplex-chat-hermes` | `127.0.0.1:5226` | SimpleX daemon (iptv) — see above |
@@ -199,13 +199,16 @@ verified 2026-07-16:
 
 ### How it fits together
 
-Solid = verified this session; dashed = typical wiring, not directly confirmed.
+Edge legend (verified 2026-07-16): **solid = confirmed** from configs/DB this session;
+**dashed = external Home Assistant** (a different host — not verifiable from this box).
+Boxed services with no edge are **running but had no active consumer found**.
 
 ```mermaid
 flowchart LR
-    subgraph ext["External"]
+    subgraph ext["External / cloud"]
         ha["Home Assistant<br/>homeassistant.localdomain:8123"]
-        cloud["Cloud LLM providers<br/>(ppq / openrouter / xai / nous)"]
+        cloud["Cloud LLM providers<br/>(ppq / xai / …)"]
+        tavily["Tavily (cloud)<br/>web search + extract"]
     end
 
     subgraph hermes["Hermes (gateways + serve)"]
@@ -219,38 +222,39 @@ flowchart LR
         owui["openwebui :8080"]
     end
 
-    subgraph voice["Voice (Wyoming)"]
+    subgraph voice["Voice (Wyoming) — likely serves HA"]
         piper["wyoming-piper :10200 (TTS)"]
         whisper["faster-whisper :10300 (STT, GPU)"]
-        oai_speech["openedai-speech :8000"]
     end
 
-    subgraph websub["Web tools"]
+    subgraph idle["Running — no active consumer found"]
         searxng["searxng :8888"]
         firecrawl["firecrawl :3000 (+redis/playwright)"]
+        oai_speech["openedai-speech :8000"]
     end
 
     manifest["manifest :2099<br/>(LLM router, standalone)"]
 
-    gw -->|"models (ppq-autoclaw)"| litellm
-    manifest -.->|"routes to"| ollama
-    litellm --> ollama
-    litellm -.-> cloud
-    gw -.->|"search / scrape"| searxng
-    gw -.->|"scrape"| firecrawl
+    gw -->|"models"| litellm
+    gw -->|"web search/extract"| tavily
     gw -->|"platform"| ha
-    owui -.-> ollama
-    owui -.-> litellm
-    ha -->|"Assist TTS/STT"| piper
-    ha --> whisper
-    ha -.->|"Assist LLM"| ollama
-    oai_speech -.->|"TTS"| owui
+    litellm -->|"local models"| ollama
+    litellm -->|"ppq / xai"| cloud
+    owui -->|"OpenAI API"| litellm
+    manifest -->|"OLLAMA_HOST"| ollama
+    ha -.->|"Assist TTS/STT"| piper
+    ha -.-> whisper
+    ha -.->|"Assist LLM?"| ollama
 ```
 
-**Reading it:** `litellm` is the LLM hub — hermes and openwebui both consume it, and it
-fans out to local `ollama` plus cloud providers. The Wyoming voice trio serves the external
-Home Assistant's Assist pipeline. `searxng` + `firecrawl` back hermes' web tooling. The
-`manifest` router and the desktop apps are independent of the hermes/simplex path.
+**Reading it:** `litellm` is the LLM hub — **hermes and openwebui both consume it**
+(verified), fanning out to local `ollama` (the `*-local` models) plus cloud (`ppq`, `xai`).
+**Hermes' web tooling uses Tavily (cloud), not the local searxng/firecrawl.** `manifest` is
+a standalone LLM router wired only to ollama. The Wyoming voice pair is exposed on `0.0.0.0`
+for the external Home Assistant's Assist pipeline (plausible, not verifiable from this host).
+**`searxng`, `firecrawl`, and `openedai-speech` are up but no consumer was found** — likely
+staged for future use or driven from a UI/config not inspected here; confirm before treating
+them as load-bearing.
 
 > **Manifest access/auth (ops note).** Dashboard `http://ai-server.localdomain:2099`, admin
 > `brandon@virtualshock.net`. Auth is **Better Auth** on Postgres
