@@ -186,7 +186,7 @@ verified 2026-07-16:
 | `firecrawl-redis` | `redis:alpine` | `6379` | Firecrawl queue/cache |
 | `firecrawl-playwright` | `firecrawl/playwright-service` | — | Firecrawl headless browser |
 | *firecrawl API* | node (`dist/api.js`) | `3000` | Firecrawl scrape API (host node process, not a container) |
-| `manifest` | `manifestdotbuild/manifest` | `2099` | "Manifest router" — lightweight backend/API framework |
+| `manifest` | `manifestdotbuild/manifest` | `2099` | **LLM router** (manifest.build) — an alternative to litellm; dashboard at `http://ai-server.localdomain:2099`, wired to `ollama` via `OLLAMA_HOST`. **Not** currently in the hermes path (standalone/aspirational). |
 | `simplex-chat-hermes` | `localhost/simplex-chat-hermes` | `127.0.0.1:5225` | SimpleX daemon (default) — see above |
 | `simplex-chat-iptv` | `localhost/simplex-chat-hermes` | `127.0.0.1:5226` | SimpleX daemon (iptv) — see above |
 
@@ -230,9 +230,10 @@ flowchart LR
         firecrawl["firecrawl :3000 (+redis/playwright)"]
     end
 
-    manifest["manifest :2099"]
+    manifest["manifest :2099<br/>(LLM router, standalone)"]
 
     gw -->|"models (ppq-autoclaw)"| litellm
+    manifest -.->|"routes to"| ollama
     litellm --> ollama
     litellm -.-> cloud
     gw -.->|"search / scrape"| searxng
@@ -250,6 +251,18 @@ flowchart LR
 fans out to local `ollama` plus cloud providers. The Wyoming voice trio serves the external
 Home Assistant's Assist pipeline. `searxng` + `firecrawl` back hermes' web tooling. The
 `manifest` router and the desktop apps are independent of the hermes/simplex path.
+
+> **Manifest access/auth (ops note).** Dashboard `http://ai-server.localdomain:2099`, admin
+> `brandon@virtualshock.net`. Auth is **Better Auth** on Postgres
+> (`postgresql.localdomain:5432/manifest`, tables `user`/`account`/`session`). Two gotchas:
+> (1) `BETTER_AUTH_URL` **and** `CORS_ORIGIN` (in `manifest.container`) must equal the exact
+> browser origin or login fails with **"invalid origin"** (not a password problem).
+> (2) **No SMTP** is configured, so there's no email password reset — recover by writing a
+> Better Auth **scrypt** hash (`N=16384,r=16,p=1,dkLen=64`, format `saltHex:keyHex`, 161
+> chars) straight into `account.password` (Node `crypto.scryptSync`), or delete the single
+> account row and re-sign-up (first account becomes admin). `psql` isn't installed — use a
+> throwaway `postgres:alpine` container with `--network=host`, sourcing `DATABASE_URL` from
+> `~/.config/containers/manifest.env`.
 
 ## Key paths (on `hermes-ai`)
 
