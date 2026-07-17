@@ -122,7 +122,8 @@ from messaging.
 - **Channels (SimpleX groups):**
   - default profile home channel = `simplex:1` (group **"hermes-agent"**) — startup /
     cron / notification target.
-  - iptv admin channel 🟡 = group `group:<GID>` (name `iptv-admin`) on the iptv daemon.
+  - iptv admin channel ✅ = group **`1`** (name `iptv-admin`) on the iptv daemon; you
+    direct the iptv agent here (two-way verified).
   - iptv notify channel 🟡 = a second group for a subset of users (receive + limited
     replies); design pending — see Phase 2 brief.
 
@@ -133,25 +134,39 @@ Each profile is a self-contained `HERMES_HOME`:
 | Profile | HERMES_HOME | SimpleX identity | Gateway |
 |---|---|---|---|
 | `default` | `~/.hermes` | `simplex-chat-hermes` (5225) | `hermes-gateway` ✅ |
-| `iptv` | `~/.hermes/profiles/iptv` | `simplex-chat-iptv` (5226) 🟡 | `hermes-gateway-iptv` 🟡 |
+| `iptv` | `~/.hermes/profiles/iptv` | `simplex-chat-iptv` (5226) ✅ | `hermes-gateway-iptv` ✅ |
 
 Config precedence for the SimpleX adapter: the profile's **`.env`** is authoritative
 (`SIMPLEX_WS_URL`, `SIMPLEX_HOME_CHANNEL[_NAME]`, `SIMPLEX_ALLOWED_USERS`,
 `SIMPLEX_ALLOW_ALL_USERS`); `config.yaml`'s `platforms.simplex` only needs
 `enabled: true`.
 
+**Model:** both profiles default to `ppq-autoclaw` via the **`litellm`** provider
+(`config.yaml` → `model.provider: litellm`, base_url `http://localhost:4000/v1`). Do NOT
+set `model.provider: custom` with `ppq-autoclaw` — "custom" routes to OpenRouter (whose
+token is expired → HTTP 401). The proxy also exposes `xai/grok-4-1-fast-reasoning` if you
+want Grok. iptv has Home Assistant **disabled** (its `HASS_*` creds are commented out).
+
 ## Authorization model (important)
 
 - Inbound authz is core (`gateway/authz_mixin.py`): `ALLOW_ALL` → env allowlist →
   pairing store → global → **deny**.
-- SimpleX authorizes a **group as a whole** (`sender_id = group:<id>`); per-member
-  gating inside a group is **not wired** for SimpleX today. (Phase 2 addresses this for
-  the notify channel.)
+- **Group messages are attributed to the individual member** — the deployed fork adapter
+  sets `sender_id` to the sender's **per-membership member id**, NOT `group:<id>`
+  (verified live). So to allowlist a person in a group you use their member id, and
+  **per-member gating within a group works** (good for the Phase 2 notify channel).
+- **Member ids are local & per-daemon.** SimpleX assigns no global user id; each daemon
+  mints its own local id for a given person. So the same human has a *different* id on
+  each daemon (e.g. Brandon = `TjdJ…` on the default daemon, `MUNH…` on the iptv daemon).
+  Each profile's `SIMPLEX_ALLOWED_USERS` needs its own daemon's id — they are not shared.
+- **Display-name matching** is also supported (`SIMPLEX_ALLOWED_USERS` accepts the
+  display name), but it is **spoofable** — prefer member ids for anything security-facing.
 - `SIMPLEX_GROUP_ALLOWED` and `SIMPLEX_AUTO_ACCEPT` are declared in `plugin.yaml` but
   **not consumed** — do not rely on them.
-- ⚠️ **Posture note:** default profile historically ran `SIMPLEX_ALLOW_ALL_USERS=true`
-  (any user could command the bot). Being locked down to an allowlist as part of the
-  iptv work — see plan Task 5.
+- ✅ **Current posture (2026-07-16):** both profiles run `SIMPLEX_ALLOW_ALL_USERS=false`,
+  id-locked. default → `TjdJ…` (member id), iptv → `MUNH…`. The old
+  `SIMPLEX_ALLOW_ALL_USERS=true` exposure on default is closed; dead `SIMPLEX_GROUP_IDS`
+  removed from both.
 
 ## Key paths (on `hermes-ai`)
 
